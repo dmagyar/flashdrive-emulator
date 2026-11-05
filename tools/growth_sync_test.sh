@@ -112,8 +112,14 @@ while IFS="$TAB" read -r SZ NM; do
     else say "  ok       $NM  $SZ B"; fi
 done < /tmp/nas-before.tsv
 
-say "--- byte-level checks (smallest files, cheap to pull) ---"
-awk -F"$TAB" '{ print }' /tmp/nas-before.tsv | sort -t"$TAB" -k1 -n | head -2 > /tmp/md5-pick.tsv
+if [ -n "${MD5_ALL:-}" ]; then
+    N=$(wc -l < /tmp/nas-before.tsv)
+    say "--- byte-level checks: ALL $N files (reads the whole library back over USB, slow) ---"
+    cp /tmp/nas-before.tsv /tmp/md5-pick.tsv
+else
+    say "--- byte-level checks (the 2 smallest files, cheap to pull; MD5_ALL=1 for every file) ---"
+    sort -t"$TAB" -k1 -n /tmp/nas-before.tsv | head -2 > /tmp/md5-pick.tsv
+fi
 while IFS="$TAB" read -r SZ NM; do
     [ -e "$M/$NM" ] || { say "  skip  $NM (not on the card)"; continue; }
     cm=$(md5sum "$M/$NM" | cut -d' ' -f1)

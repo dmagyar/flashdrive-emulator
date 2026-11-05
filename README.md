@@ -20,9 +20,10 @@ Working and verified on silicon. The full library syncs byte-exactly with no man
 | measured on this bench | value |
 |---|---|
 | whole sync (61,234,228 B, 4 files) | **155–166 s → 370–400 KB/s** |
+| incremental pickup (9 new files into a 411 MB library) | 977 s, 0 reconnects, 10/10 sizes match |
 | network stage alone (reads, no writes) | 482–554 KB/s |
 | SD card write stage alone | **1430 KiB/s** |
-| byte integrity vs NAS | md5 identical, **4/4 files, 2/2 runs**, 0 reconnects |
+| byte integrity vs NAS | md5 identical: 4/4 files ×2 runs (61 MB) **and 10/10 files (411 MB)**, 0 reconnects |
 | interrupted transfers | resume from `.part` at the exact byte, after re-verifying the prefix |
 | at the start of development | 8 KB/s (one socket timeout per request) |
 
@@ -231,9 +232,23 @@ mounts the card, hands it straight to the host, and waits. Consequences worth kn
   interruption, not a hang. The next pass resumes that file from its last fsync watermark.
 
 Measured on the bench: the share was swapped from a 4-file test set to a 10-track / 411 MB album
-while the board was idle and host-owned. The next detach cycle started fetching the new files
-immediately and completed `10.mp3` (43,182,670 B, 0 reconnects) before the host came back; the
-following pass resumed `09.mp3` from its 24 MiB `.part`.
+while the board was idle and host-owned. The next detach cycle picked the new files up with no
+help, and one pass did this (`tools/growth_sync_test.sh`, whole run):
+
+```
+sync start: //10.119.0.4/CAR-MEDIA/ -> / (filter '*.mp3')
+  continuing /09.mp3 at 25165824/43216524 B (prefix verified)
+  + /09.mp3 ... + /01.mp3            9 files, 0 reconnects, 0 warnings
+sync done: 9 copied (388023987 bytes), 1 already present, 0 deferred
+```
+
+977 s, **all ten files md5-identical to the NAS** (411 MB verified byte-for-byte), no
+reconnects, no warnings. The resume is the interesting part: a previous pass had been
+interrupted inside `09.mp3` at exactly its last 4 MiB fsync watermark (25,165,824 B), and the
+next pass re-verified that prefix and continued from it instead of restarting the file.
+
+Running it again with nothing new gave `sync done: 0 copied (0 bytes), 10 already present` in
+**234 ms** — a detach that finds nothing costs the listener nothing and wears the card not at all.
 
 ### Per file
 
@@ -294,6 +309,13 @@ the device can never modify or delete what is on the NAS.
 `PBUF_POOL_SIZE` is not exposed in Kconfig (it lives in lwIP's `opt.h`, guarded), so it is
 overridden in the root `CMakeLists.txt`: 16 buffers × ~1480 B ≈ 23.7 KiB cannot back a 64 KiB
 window, and a segment with nowhere to land is dropped.
+
+> **`copied ... bytes` overstates a pass that resumed.** `s_copied_bytes` adds the file's full
+> size, including bytes a previous pass had already written into the `.part`. In the run above it
+> reported 388,023,987 B while only 362,858,163 B crossed the wire — 7 % high, which is exactly
+> the margin an A/B test would be decided on. Divide *fetched* bytes, not reported bytes, by the
+> pass duration when computing throughput; the per-file `... N/41 MB` progress lines count the
+> whole file as well.
 
 **The wall is hardware.** ~400 KB/s with 1-bit SDMMC (20 MHz) sharing one chip with a 2.4 GHz
 radio. Big read buffers are impossible regardless of what the server allows: internal DMA heap
