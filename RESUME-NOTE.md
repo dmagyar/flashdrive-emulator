@@ -158,9 +158,14 @@ walk; `card_path()` no longer emits `/msc///name`.
   read at 8 MiB (`max_read` logged) and internal DMA heap is ~168 KiB free / 90 KiB largest block,
   while PSRAM is not SDMMC-DMA-able. The wall beyond this is hardware: 1-bit SD (D1/D2/D3 unrouted)
   sharing one chip with the radio — needs a different carrier, not more firmware.
-- **No version control.** `/home/hermes/board-schematics` is not a git repo; this session changed
-  `main/bridge_main.c`, `main/smb_path.h`, `tools/`, and 4 files under the vendored
-  `sahlberg__libsmb2`. Nothing is committed because nothing is tracked.
+- **Repo: `flashdrive-emulator`** (private, `github.com/dmagyar/flashdrive-emulator`). This directory
+  is the repo root; the local directory stays `bridge/` because every script in `tools/` hardcodes
+  that path. Baseline `ea38f24`. Push through the per-repo deploy-key alias —
+  `origin = git@github.com-flashdrive-emulator:dmagyar/flashdrive-emulator.git` — because the literal
+  `git@github.com:` URL is refused: it never offers the deploy key (verified both ways).
+  Ignored: `build/` (175 MB) and the generated `sdkconfig`/`sdkconfig.old`. Tracked on purpose:
+  `components/espressif__*` — there is no `idf_component.yml`, so the component manager will not
+  fetch them and a clone without them does not build.
 - No RTC: files land stamped `Jan 1 1980`. SNTP before caring about "recently added" sorting.
 - `BRIDGE_DRY_RUN` (compile-time, 0) is still in the tree as a diagnostic switch.
 - Not yet tested: a library larger than one card, and playback on a real head unit.
