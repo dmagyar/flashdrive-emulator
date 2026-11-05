@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+#
+# The default single-app partition is 1 MiB, which this firmware outgrows the moment
+# Wi-Fi + lwIP + libsmb2 are linked in. The SD card holds all the media, so the only
+# thing that needs to be large here is the app.
+nvs,      data, nvs,     0x9000,   0x6000,
+otadata,  data, ota,     0xf000,   0x2000,
+phy_init, data, phy,     0x11000,  0x1000,
+factory,  app,  factory, 0x20000,  0x400000,

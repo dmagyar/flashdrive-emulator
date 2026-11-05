@@ -1,0 +1,47 @@
+# ---- board facts (measured, see ../BOARD.md): N16R8 module, 16 MB flash, 40 MHz crystal
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_XTAL_FREQ_40=y
+
+# Console stays on UART0 (the CH34x bridge, GPIO43/44). GPIO19/20 must be free for the
+# native USB-OTG peripheral; USB-Serial-JTAG sits on those same pins and would steal them.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+
+# Octal PSRAM as fitted. libsmb2's PDU buffers land here via heap_caps (malloc), which
+# keeps internal DMA-capable RAM free for the USB controller.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# 16 MB flash, but a >1 MiB app (Wi-Fi + lwIP + libsmb2 + TinyUSB + FatFS).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_FREERTOS_HZ=1000
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# USB Device on the native OTG peripheral (GPIO19 D-, GPIO20 D+), MSC class only.
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_MOUNT_PATH="/msc"
+CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="ESP32-S3 CAM bench"
+CONFIG_TINYUSB_DESC_PRODUCT_STRING="ESP32-S3 Media Bridge"
+CONFIG_TINYUSB_DESC_MSC_STRING="SD Card"
+
+# Long file names are mandatory for a real music library.
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+CONFIG_FATFS_FS_LOCK=16
+
+# Wi-Fi station + a handful of sockets. SMB is one TCP connection; the sync engine is the
+# only consumer, so keep lwIP small but give it a sane TCP window for a 2.4 GHz link.
+CONFIG_LWIP_MAX_SOCKETS=8
+CONFIG_LWIP_TCP_SND_BUF=8192
+CONFIG_LWIP_TCP_WND_DEFAULT=65535
+# Selective ACKs: with a 64 KiB window on a 2.4 GHz radio, one dropped segment must not force
+# go-back-N from the gap. Needs LWIP_TCP_QUEUE_OOSEQ (on by default).
+CONFIG_LWIP_TCP_SACK_OUT=y
+
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
