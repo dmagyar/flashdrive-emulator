@@ -180,6 +180,18 @@ shown, so a minimally-provisioned device works out of the box.
 | `filt` | Filter | `*.mp3` | filename filter for the walk |
 | `ldir` | Folder on card | `/MUSIC` | destination directory on the card |
 | `dialect` | SMB dialect | `auto` | `auto` negotiates; see below |
+| `recurs` | *(not prompted)* | `1` | recurse into subfolders; the walk depth limit is a hardcoded 8 |
+| `seal` | *(not prompted)* | `0` | force SMB3 sealing (untested against a server that requires it) |
+| `maxmb` | *(not prompted)* | `0` → 14000 | **not enforced anywhere** — see the caveat below |
+
+Provisioning prompts for the ten strings and writes `recurs=1`, `seal=0` as fixed values, so the
+three integers have to be changed by an NVS write, not by answering prompts.
+
+> **`maxmb` does nothing.** It is read from NVS, stored, and printed in the boot log
+> (`cap=%d MB`), but no code path consults it. The only capacity protection that exists is the
+> per-file free-space check in `walk()`: a file is fetched only if the card has
+> `size + 64 MB` free, and if not, the pass stops with `ERR_FAT`. Do not rely on `maxmb` to keep a
+> big library off a small card — cap it with `sub`/`filt` instead.
 
 **Dialect:** leave it `auto`. Synology DSM refuses a *pinned* SMB 2.0.2 negotiate
 (`0xC00000BB`), while accepting an offer range; the ladder is `{ANY2, ANY3, ANY}`. DSM's floor is
@@ -204,8 +216,46 @@ the ownership handover and fail partway.
 
 ## How the sync works
 
+### When a pass runs — and when it does not
+
+A pass runs **only** when the host releases the volume: a physical `TINYUSB_EVENT_DETACHED`
+plus the 3 s quiet window. There is no timer, and there is **no pass at boot** — the firmware
+mounts the card, hands it straight to the host, and waits. Consequences worth knowing:
+
+- Tracks you add to the share appear on the card the **next time the car lets go of the disk**
+  (ignition off, or unplug/replug) — not while you are driving, and not the moment you copy them.
+- While the host owns the volume the card is untouched by design, so the bridge never has to
+  revoke a disk from a live reader.
+- If the host returns mid-pass, the pass aborts and the half-written file stays as a `.part`.
+  The log then ends **without** a `sync done:` / `sync FAILED:` line — a missing summary is an
+  interruption, not a hang. The next pass resumes that file from its last fsync watermark.
+
+Measured on the bench: the share was swapped from a 4-file test set to a 10-track / 411 MB album
+while the board was idle and host-owned. The next detach cycle started fetching the new files
+immediately and completed `10.mp3` (43,182,670 B, 0 reconnects) before the host came back; the
+following pass resumed `09.mp3` from its 24 MiB `.part`.
+
+### Per file
+
 Per file: `smb2_pread` in 32 KiB chunks into an **internal, DMA-capable** buffer → `fwrite` into
 `<target>.part` → `fflush`+`fsync` every 4 MiB → `rename` into place.
+
+### What counts as "already copied"
+
+`walk()` compares **size only**: `card_has(rel)` and if the card's size equals the share's size,
+the file is skipped. So
+
+- a brand-new file, or a file missing/renamed on the card, is fetched;
+- a track you *replaced* on the share is re-fetched only if its size changed — same-size
+  different-content is silently kept from the card. Delete it from the card to force a refresh;
+- **sync is additive.** Deleting or renaming on the share does not remove anything from the card.
+  After the library swap above, the card kept three orphan tracks from the old set; that is
+  expected behaviour, not corruption. Clear the card (or the folder) to prune.
+
+The bridge's own SMB account is read-only on the share, which is how it should be provisioned:
+the device can never modify or delete what is on the NAS.
+
+### Rules that are load-bearing
 
 - **Internal DMA RAM is not optional.** With `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384`, a
   32 KiB `malloc()` silently returns PSRAM — and ESP32-S3 has no `SOC_SDMMC_PSRAM_DMA_CAPABLE`,
@@ -293,6 +343,8 @@ variable — never in argv, never printed).
 |---|---|
 | `detach_test.sh [quiet] [capture]` | the real loop: boot the app, capture the console **passively**, de-authorize the USB device (the "ignition off" equivalent), report what the bridge did |
 | `cold_sync_proof.sh` | wipe the synced files → cold sync → checksum every file against the NAS. The acceptance test |
+| `growth_sync_test.sh` | the everyday case: the share gained tracks. One detach cycle must fetch exactly what is new, resume any `.part`, skip the rest, then size-check the whole library and md5 the cheapest files. Long: background it |
+| `new_file_sync_test.sh` | single-file incremental proof. Drops a probe into a new folder on the share if the account can write; otherwise renames one synced file on the card (keeping the bytes as a safety net) to hit the same `walk()` branch |
 | `verify_card_vs_nas.sh` | md5 the card against the share, `ok`/`MISMATCH` per file |
 | `card_write_probe.sh` | card throughput in isolation (`BRIDGE_WRITE_ONLY`) |
 | `split_stages_test.sh` | network stage vs network+write stage (`BRIDGE_DRY_RUN`) |
