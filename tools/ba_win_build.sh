@@ -1,8 +1,12 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Build every arm of the RX_BA_WIN A/B, with the resolved value ASSERTED before an image is kept.
 #
-#   sh tools/ba_win_build.sh            # -> dist/bridge-base.bin, dist/bridge-ba20.bin,
-#                                       #    dist/bridge-ba25buf25.bin
+#   bash tools/ba_win_build.sh            # -> dist/bridge-base.bin, dist/bridge-ba20.bin,
+#                                         #    dist/bridge-ba25buf25.bin
+#
+# bash, not sh: esp-idf's export.sh resolves IDF_PATH from ${BASH_SOURCE[0]}, which is empty under
+# dash - sourced under dash it prints "Could not automatically detect IDF_PATH" and returns
+# non-zero, which under `set -e` ends the script before its first echo.
 #
 # Why all three are built the same way. `idf.py build` honours the existing `sdkconfig`, and
 # `sdkconfig.defaults` only fills keys that file does NOT already contain - demonstrated, not
@@ -24,7 +28,10 @@
 #                                     buffer bump alone already measured +2% and was reverted
 set -eu
 cd "$(dirname "$0")/.."
-. /home/hermes/esp/esp-idf/export.sh >/dev/null 2>&1
+# `|| true` is load-bearing: export.sh's last command exits non-zero, and under `set -e` sourcing
+# it aborts the script before the first echo - silently, because the redirect eats the evidence.
+. /home/hermes/esp/esp-idf/export.sh >/dev/null 2>&1 || true
+command -v idf.py >/dev/null 2>&1 || { echo "FAIL: idf.py not on PATH after sourcing the IDF export - no build will happen"; exit 1; }
 DEF=sdkconfig.defaults
 mkdir -p dist
 

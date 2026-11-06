@@ -443,6 +443,11 @@ variable — never in argv, never printed).
 | `negmatrix.sh` / `negprobe.c` | SMB dialect matrix, run with the *actual* library |
 | `readstall_probe.c`, `interleave_probe.c` | reproduce firmware SMB behaviour on a host, where it is cheaper to debug |
 | `apply_overlap.py` / `revert_overlap.sh` | the writer-task experiment, in both directions (idempotent patcher + verified restore) |
+| `apply_prune.py` | the deletion-propagation patcher, applied to `git show HEAD:main/bridge_main.c` — reproduces the working tree byte-identically, so the feature is reviewable as a script |
+| `prune_host_test.py` | runs the **shipping** pruning code (extracted from `main/bridge_main.c`, not copied) against a real temp directory and a stubbed share: 26 checks, no hardware needed. Gate a flash on it |
+| `prune_proof.sh [n]` | end-to-end deletion proof on the real card: plants `n` orphan `.mp3` the share never saw plus 3 decoys that must survive, runs one pass, then asserts the orphans are gone, the decoys are kept, and every real track is unchanged. The last assertion is the point |
+| `ba_win_build.sh` | builds every `RX_BA_WIN` arm through `idf.py set-target`, asserting each arm's **resolved** symbol (baseline included) before keeping its image |
+| `ba_win_matrix.sh ARM image [reps] [files]` | flash one prepared arm image, boot it, wait for enumeration, run `reps` timed passes; fails rather than reporting a missing pass |
 
 Testing rules that saved this project, encoded in those scripts:
 
@@ -452,6 +457,9 @@ Testing rules that saved this project, encoded in those scripts:
   present` measures nothing.
 - Never `pyserial` for capture; `stty raw -echo` + `cat`.
 - Never conclude from one sample: run-to-run spread on *identical* firmware here is ~7 %.
+- **Before a null result, prove the knob moved.** Assert the resolved symbol in each arm's
+  `sdkconfig` — the baseline included, or two "different" firmwares may be one configuration. Three
+  of this project's measurement attempts were voided by a value that never reached the binary.
 
 ---
 
