@@ -22,11 +22,7 @@
 set -eu
 LOG=${1:-refile.log}
 PORT=$(ls /dev/serial/by-id/*1a86* | head -1)
-# Resolve the card by VENDOR, never by "the first vfat". This bench has a 1.9 GB CHIPSBNK vfat
-# stick next to the bridge's 14.8 GB TinyUSB volume, so a positional guess would have mounted -
-# and then flattened - somebody else's disk. Exactly one match or nothing runs.
-DEV=$(lsblk -rpno NAME,VENDOR 2>/dev/null | awk '$2=="TinyUSB"{print $1}')
-[ "$(printf '%s\n' "$DEV" | grep -c .)" = "1" ] || { echo "FAIL: want exactly one TinyUSB volume, got [$DEV]"; exit 1; }
+DEV=$(card_dev) || exit 1
 echo "card = $DEV"
 AUTH=/sys/bus/usb/devices/1-1.5/authorized
 MNT=/mnt/car
@@ -35,6 +31,23 @@ MNT=/mnt/car
 exec 9>/tmp/bridge.lock
 flock -n 9 || { echo "REFUSING TO RUN: another bench harness holds the port."; exit 1; }
 
+# Resolve the bridge's card by the USB vendor ID of the device itself - Espressif is 303a - never
+# by a vendor/model string and never by position. Two traps measured on this bench: an unrelated
+# 1.9 GB CHIPSBNK vfat stick sits next to the card (1e3d), so "the first vfat" mounts the wrong
+# disk; and `lsblk -r` escapes the vendor string's trailing space as "TinyUSB\x20", so an exact
+# string match silently returns nothing and a proof aborts while the hardware is healthy.
+card_dev() {
+    _c=""
+    for _b in /sys/block/sd*; do
+        [ -e "$_b" ] || continue
+        if udevadm info -q property -n "/dev/$(basename "$_b")" 2>/dev/null | grep -q '^ID_VENDOR_ID=303a$'; then
+            [ -n "$_c" ] && { echo "card_dev: more than one Espressif MSC volume: $_c and /dev/$(basename "$_b")" >&2; return 1; }
+            _c="/dev/$(basename "$_b")"
+        fi
+    done
+    [ -n "$_c" ] || { echo "card_dev: no Espressif (303a) mass-storage volume on the bus" >&2; return 1; }
+    printf '%s\n' "$_c"
+}
 auth() {  # $1 = 0|1 ; retry, believe only the read-back (authorizing during re-enumeration
           # returns EPROTO and a lost write would leave the volume ownerless)
     i=0

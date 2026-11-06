@@ -20,7 +20,7 @@
 # The EXIT trap hands the volume back whatever happens, so a bail-out cannot leave the bench
 # holding a disk the host can no longer see.
 set -eu
-BIN=$1; LOG=$2; MAX=${3:-1500}
+BIN=$1; LOG=$2; MAX=${3:-1500}; WIPE=${4:-0}
 PORT=$(ls /dev/serial/by-id/*1a86* | head -1)
 
 # ONE harness owns the bench. A second script that writes .../authorized can abort the first
@@ -46,6 +46,23 @@ done
 [ -n "$D" ] || { echo "ESP32 not on the bus"; exit 1; }
 DAUTH="$D/authorized"
 
+# Resolve the bridge's card by the USB vendor ID of the device itself - Espressif is 303a - never
+# by a vendor/model string and never by position. Two traps measured on this bench: an unrelated
+# 1.9 GB CHIPSBNK vfat stick sits next to the card (1e3d), so "the first vfat" mounts the wrong
+# disk; and `lsblk -r` escapes the vendor string's trailing space as "TinyUSB\x20", so an exact
+# string match silently returns nothing and a proof aborts while the hardware is healthy.
+card_dev() {
+    _c=""
+    for _b in /sys/block/sd*; do
+        [ -e "$_b" ] || continue
+        if udevadm info -q property -n "/dev/$(basename "$_b")" 2>/dev/null | grep -q '^ID_VENDOR_ID=303a$'; then
+            [ -n "$_c" ] && { echo "card_dev: more than one Espressif MSC volume: $_c and /dev/$(basename "$_b")" >&2; return 1; }
+            _c="/dev/$(basename "$_b")"
+        fi
+    done
+    [ -n "$_c" ] || { echo "card_dev: no Espressif (303a) mass-storage volume on the bus" >&2; return 1; }
+    printf '%s\n' "$_c"
+}
 authorize () {
     i=0
     while [ "$i" -lt 10 ]; do
@@ -74,6 +91,39 @@ stty -F "$PORT" 115200 raw -echo
 nohup timeout $((MAX + 180)) cat "$PORT" > "/tmp/$LOG" 2>/dev/null &
 CAT=$!
 sleep 1
+# Clean-slate run. The bridge, not the harness, decides who holds the volume: authorized=1 alone
+# does NOT hand it over - the firmware gives it up when a pass finishes. So the wipe runs between
+# passes: take the volume back, let it complete (fast - the archive already holds these tracks),
+# let it hand over, and only then is the host allowed to clear the card.
+if [ "$WIPE" = "1" ]; then
+    echo "== warm-up pass, so the bridge hands the volume over =="
+    authorize 0 || true
+    i=0
+    while [ "$i" -lt 600 ]; do
+        grep -aq 'sync done:\|sync FAILED:' "/tmp/$LOG" && break
+        sleep 5; i=$((i + 5))
+    done
+    sleep 3
+    authorize 1 || true
+    DEV=""
+    i=0
+    while [ "$i" -lt 40 ]; do
+        DEV=$(card_dev 2>/dev/null) && break
+        sleep 2; i=$((i + 2))
+    done
+    [ -n "$DEV" ] || { echo "wipe: no Espressif MSC volume appeared after hand-back"; exit 1; }
+    sleep 3
+    if ! mount -o rw "$DEV" /mnt/car 2>/dev/null; then
+        echo "wipe: $DEV would not mount rw - refusing to continue (the bridge no longer formats it)"
+        exit 1
+    fi
+    find /mnt/car -mindepth 1 -maxdepth 1 ! -name lost+found -exec rm -rf {} + 2>/dev/null || true
+    echo "wipe: card cleared, $(find /mnt/car -mindepth 1 -name '*.mp3' | wc -l) mp3 left"
+    sync; umount /mnt/car
+    # The pass counter greps for a completion line; the warm-up pass already left one in the file.
+    : > "/tmp/$LOG"
+fi
+
 authorize 0                                  # the host lets go; the bridge runs a pass
 i=0; done_=0
 while [ "$i" -lt "$MAX" ]; do
@@ -91,6 +141,21 @@ authorize 1
 trap - EXIT INT TERM
 i=0
 while [ ! -b /dev/sdb ] && [ "$i" -lt 40 ]; do sleep 1; i=$((i + 1)); done
+
+if [ "$WIPE" = "1" ]; then
+    echo "== card as a reader sees it =="
+    CARD=$(card_dev 2>/dev/null || true)
+    if [ -n "$CARD" ] && mount -o ro "$CARD" /mnt/car 2>/dev/null; then
+        echo "  root mp3  : $(find /mnt/car -maxdepth 1 -name '*.mp3' | wc -l)   (want 0 in archive mode)"
+        echo "  in folders: $(find /mnt/car -mindepth 2 -name '*.mp3' | wc -l)"
+        echo "  .part left: $(find /mnt/car -name '*.part' | wc -l)"
+        find /mnt/car -mindepth 1 | sed "s|/mnt/car/||" | sort | head -24
+        df -h /mnt/car | tail -1
+        sync; umount /mnt/car
+    else
+        echo "  could not mount the card read-only"
+    fi
+fi
 
 echo "== the bridge's own report =="
 tr -d '\r' < "/tmp/$LOG" | grep -aE 'config:|filed |retired |archive:|dates:|prune |sync done:|sync FAILED' \
