@@ -146,7 +146,13 @@ while [ ! -b /dev/sdb ] && [ "$i" -lt 40 ]; do sleep 1; i=$((i + 1)); done
 
 if [ "$WIPE" = "1" ]; then
     echo "== card as a reader sees it =="
-    CARD=$(card_dev 2>/dev/null || true)
+    CARD=""
+    i=0
+    while [ "$i" -lt 30 ]; do                 # the bridge hands the volume over a few seconds after
+        CARD=$(card_dev 2>/dev/null || true)   # the pass ends; polling beats sleeping for a guess
+        [ -n "$CARD" ] && break
+        sleep 2; i=$((i + 2))
+    done
     if [ -n "$CARD" ] && mount -o ro "$CARD" /mnt/car 2>/dev/null; then
         echo "  root mp3  : $(find /mnt/car -maxdepth 1 -name '*.mp3' | wc -l)   (want 0 in archive mode)"
         echo "  in folders: $(find /mnt/car -mindepth 2 -name '*.mp3' | wc -l)"

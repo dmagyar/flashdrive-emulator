@@ -129,7 +129,8 @@ static const char *TAG = "bridge";
 
 /* ---------------------------------------------------------------- error classes */
 enum { ERR_WIFI = 2, ERR_SMB_SESSION = 3, ERR_SMB_IO = 4, ERR_FAT = 5, ERR_NOCARD = 6,
-           ERR_CONFLICT = 7 };
+           ERR_CONFLICT = 7,
+           ERR_SHORTSRC = 8 };   /* source delivered fewer bytes than it advertised */
 
 typedef enum {
     ST_PROVISION, ST_WIFI, ST_WAIT, ST_SYNC, ST_READY, ST_ERROR, ST_FATAL
@@ -1223,6 +1224,21 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
              * So the session is left alone and the pass ends here. Nothing is lost: every byte is
              * flushed to the card below, and the next pass resumes the same file from its .part
              * with the prefix re-verified - a pass boundary instead of a crash. */
+            /* got == 0 with no error set is not a stalled session: it is a clean EOF. The share
+             * advertised `size` bytes in the readdir reply and then delivered fewer, which is
+             * what a rolling recorder looks like - the newest chunk is replaced by the rotation
+             * between the listing and the read, so its length is stale by the time we ask for
+             * the tail. Confirmed on silicon: the same file, the same offset (43166369 of
+             * 43197717), twice, and smb2_get_error() returned an empty string both times.
+             * Calling that a transport failure costs the whole pass; it is one file's problem,
+             * and the next pass will be told the file's real size. */
+            if (got == 0) {
+                ESP_LOGW(TAG, "  %s: share ended at %llu of the advertised %llu B - source rotated while we read it, keeping the %llu B we have",
+                         rel, (unsigned long long)off, (unsigned long long)size,
+                         (unsigned long long)off);
+                fflush(out); fsync(fileno(out));
+                rc = ERR_SHORTSRC; goto done;   /* .part stays: next pass resumes at this offset */
+            }
             ESP_LOGW(TAG, "  %llu/%llu B: %s - session unusable, ending the pass here (resumes next pass at %llu B)",
                      (unsigned long long)off, (unsigned long long)size, smb2_get_error(s_smb),
                      (unsigned long long)off);
@@ -1405,7 +1421,8 @@ static int walk(const char *rel_dir, int depth)
         s_failed_files++;
         ESP_LOGW(TAG, "skipping %s this run (%s) - carrying on with the rest", rel,
                  frc == ERR_SMB_SESSION ? "SMB session" :
-                 frc == ERR_CONFLICT ? "name conflict on the card" : "transfer failed");
+                 frc == ERR_CONFLICT ? "name conflict on the card" :
+                 frc == ERR_SHORTSRC ? "share was shorter than it claimed" : "transfer failed");
     }
     smb2_closedir(s_smb, d);
     return rc;
