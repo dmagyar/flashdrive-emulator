@@ -290,7 +290,7 @@ called:
 | | |
 |---|---|
 | identity | the `(size, mtime)` pair the SMB2 `readdir` reply already carries — no extra round trip |
-| placement | `MUSIC/YYYYMMDD/<name>`, the date taken from the share's own mtime in the owner's zone (`tzo`), so the folder and the date the head unit shows cannot disagree |
+| placement | `<ldir>/YYYYMMDD/<name>` — one folder per day under the configured card folder (`ldir`, default `/MUSIC`; `/` puts them at the top of the volume), the date taken from the share's own mtime in the owner's zone (`tzo`), so the folder and the date the head unit shows cannot disagree. Depth matters: many head units index only one or two levels |
 | already have it? | look for those bytes anywhere on the card; found under an older name → `rename(2)` it. FatFs moves a file between directories by rewriting the **directory entry**, so no megabytes cross the Wi-Fi and no clusters are reallocated |
 | retention | keep the newest `keepd` date folders, retire the oldest whole folder — decided by the **card's own calendar**, so a network that is down cannot delete anything |
 | card full | retire the single oldest folder and retry the file, one folder per file rather than clearing the card in a bad moment |
@@ -309,6 +309,28 @@ Two consequences worth being explicit about:
 `tools/archive_host_test.py` exercises this on the host against a real directory tree (41 checks) —
 including the inode assertion that proves filing moves no data, and the guard-rail cases where a
 retirement must *not* happen.
+
+### When a transfer goes wrong
+
+Each of these is a different failure with a different cost, so they are handled differently. The
+rule behind all of them: **an interruption is not corruption, and one file's problem must not
+cost the library.**
+
+| What happened | What the bridge does | Why |
+|---|---|---|
+| A read stalls with a real SMB error | Ends the **pass** at that file. Bytes already read are flushed and `fsync`ed, the `.part` stays, the next pass resumes from it | It must not rebuild the SMB session mid-walk: `walk()` is iterating a directory handle owned by that session, and tearing it down under the walk faults the CPU. That was a real reboot, not a hypothetical — see below |
+| The share delivers fewer bytes than its `readdir` size | Logs `share ended at N of the advertised M B`, keeps the `.part`, counts the file **deferred**, and **carries on** with the rest | A rolling recorder replaces the newest chunk between the listing and the read, so the length is stale. A zero-length read with no SMB error is a clean EOF, not a dead connection — treating it as one used to abort the pass every time |
+| One track is unreadable (name clash, transfer fails) | Skips it, counts it, continues | A single bad file must not starve the rest of the library |
+| The card is full | Retires the **single oldest date folder** and retries that file | One folder per file, rather than clearing the card in a bad moment |
+| The host takes the volume back mid-file | Stops, keeps the `.part`, hands over | That is the normal end of a sync, not an error |
+
+Two consequences worth knowing before reading a log:
+
+- **A walk that ends early postpones retention deliberately.** `prune_missing()` and date-folder
+  expiry only run after a walk that completed, because a half-seen share says nothing reliable
+  about what the card should hold.
+- **Nothing here formats the card.** See
+  [Mount failure refuses the card](#mount-failure-refuses-the-card).
 
 ### Deleting what left the share
 
@@ -460,30 +482,50 @@ Every row below is a defect that actually happened on this hardware.
 | transfer completes, no file appears | a **directory** is sitting on the target name — a "mkdir parents" helper that also `mkdir`s the file itself makes `rename(.part → X.mp3)` fail `EEXIST` forever. `stat` the destination before blaming the network |
 | `0-byte .part` after minutes of transfer | missing periodic `fsync`; bytes were still in the stdio buffer |
 | `.part` deleted every run, transfer restarts at 0 | reading the prefix from `SEEK_END` returns 0 bytes → false mismatch. Seek to `SEEK_SET` first |
-| mount fails, **card is reformatted** | see [Hazard](#known-hazard-mount-failure-reformats-the-card) |
+| mount fails, card looks empty | the bridge **refuses the card** (LED red, 6 blinks) and leaves it untouched — see [Mount failure refuses the card](#mount-failure-refuses-the-card) |
 | `statvfs()` always fails | IDF's FAT VFS has no statvfs hook; the code uses `esp_vfs_fat_info()` |
 | sync silently never starts | your console capture reset the board. Opening the port with pyserial pulses DTR/RTS and the CH34x turns that into an EN pulse — capture with `stty raw -echo` + `cat` instead |
 | every file stamped `Jan 1 1980` | no RTC and no SNTP yet (see Limitations). Head units sort by date |
 | a knob change does nothing | `build.sh` runs `idf.py set-target`, which **deletes `sdkconfig`** and regenerates it from `sdkconfig.defaults`. A knob that is not in `sdkconfig.defaults` does not exist |
 
-### Known hazard: mount failure reformats the card
+### Mount failure refuses the card
 
-`main/bridge_main.c` currently sets `.config.format_if_mount_failed = true` with
-`.do_not_format = false`. Consequence: **if the FAT mount fails — for instance a card formatted
-with a partition table by a PC — the firmware wipes and rebuilds the volume.** Media and
-evidence both go. A freshly-formatted card is the intended state, so this has never fired in
-testing, but the safe default for a device holding someone's music library is *never* format
-without an explicit instruction. Until that is changed: only insert cards formatted as described
-above, and back up the card before inserting it.
+The storage config sets `.config.format_if_mount_failed = false` with `.do_not_format = true`:
+**a failed mount leaves the card byte-for-byte untouched** and the LED reports it (red, six
+blinks). Format it deliberately with the `mkfs.fat` recipe above if that is what you want.
+
+This was the opposite until [this commit](../../commit/9faac21). With `format_if_mount_failed =
+true`, a card that failed to mount — an MBR written by a PC, a partial write, a card edge going
+bad — was **wiped and rebuilt by the firmware**, silently, with no prompt and no log beyond the
+mount error. The exact moment the volume is at its most questionable was the moment the code
+destroyed the evidence and the owner's library. On a bench that is a lost afternoon; in a car,
+where ignition cycles make odd power events likely and nobody can read the console, it is
+unrecoverable data loss with no warning. A device that holds someone's music never formats
+without being told to, so the safe behaviour is now the compiled-in behaviour and there is no
+flag to turn it back on.
 
 ---
 
 ## Bench tooling
 
 `tools/` contains the harness that produced every number in this file. They assume the bench:
-board on a serial console + OTG into a Linux host (`/dev/sdb`, vendor `TinyUSB`, label
-`CAR-BRIDGE`), NAS reachable, credentials in `/root/.smbcreds` (mode 600, passed by environment
-variable — never in argv, never printed).
+board on a serial console + OTG into a Linux host, NAS reachable, credentials in
+`/root/.smbcreds` (mode 600, passed by environment variable — never in argv, never printed).
+
+Find the card by the **USB vendor ID of the device**, not by a vendor string and not by position:
+
+```sh
+for b in /sys/block/sd*; do
+    udevadm info -q property -n "/dev/$(basename "$b")" | grep -q '^ID_VENDOR_ID=303a$' \
+        && echo "/dev/$(basename "$b")"
+done
+```
+
+Two traps here, both hit on this bench. A 1.9 GB `CHIPSBNK` vfat stick sits next to the card
+(`1e3d`), so "the first vfat" mounts the wrong disk and a proof then rewrites somebody else's
+data. And `lsblk -r` **escapes the vendor string's trailing space** — the field comes out as
+`TinyUSB\x20`, so `[ "$v" = "TinyUSB" ]` is false, the lookup returns nothing, and the harness
+aborts while the hardware is perfectly healthy.
 
 | script | what it proves |
 |---|---|
