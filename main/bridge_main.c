@@ -41,9 +41,12 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
+#include <utime.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -260,6 +263,14 @@ static sdmmc_card_t *sd_open(esp_blockdev_handle_t *bdl)
 }
 
 /* -------------------------------------------------------------- provisioning/NVS */
+/* Zone offset baked into the build, used only when NVS has no "tzo" key yet - i.e. before
+ * anyone has provisioned it. UTC (0) is the neutral default; a fleet that lives in one zone
+ * can build with -DBRIDGE_TZO_DEFAULT=60 and never think about it again. Defined here because
+ * config_load() reads it long before the timestamp code that applies it. */
+#ifndef BRIDGE_TZO_DEFAULT
+#define BRIDGE_TZO_DEFAULT 0
+#endif
+
 typedef struct {
     char ssid[65], psk[66];
     char srv[64], share[64], sub[192], user[64], pass[65];
@@ -269,6 +280,7 @@ typedef struct {
     uint32_t dialect;     /* first offer to try; see s_dialect_tab */
     bool dialect_auto;    /* offer a range (+ fallbacks) and let the server pick its floor */
     int max_mb;
+    int tzo_min;        /* minutes added to card timestamps: FAT stores no zone, 0 = UTC */
     bool seal, recurs, prune;
     bool have_creds;      /* Wi-Fi + SMB both present */
 } cfg_t;
@@ -367,13 +379,20 @@ static bool cfg_load(void)
      * turns into a library nobody can find anything in. Refuse-with-guards, not silently-off. */
     if (nvs_get_u16(h, "del", &v) != ESP_OK) v = 1;
     s_cfg.prune = (v != 0);
+    /* Card timestamps. FAT has no timezone field and this device has no clock that knows the
+     * zone, so utime() writes the UTC break-down as-is; tzo_min shifts it onto the owner's wall
+     * clock (60 = Netherlands in winter, 120 in summer, -300 = US Eastern). 0 keeps UTC. */
+    int16_t zv = BRIDGE_TZO_DEFAULT;
+    if (nvs_get_i16(h, "tzo", &zv) != ESP_OK) zv = BRIDGE_TZO_DEFAULT;
+    s_cfg.tzo_min = zv;
     nvs_close(h);
 
     s_cfg.dialect = dialect_parse(s_cfg.dial, &s_cfg.dialect_auto);
     s_cfg.have_creds = s_cfg.ssid[0] && s_cfg.srv[0] && s_cfg.share[0];
-    ESP_LOGI(TAG, "config: wifi='%s' smb=//%s/%s%s user='%s' filter='%s' -> %s (dialect offer %s, seal=%d, cap=%d MB, prune=%d)",
+    ESP_LOGI(TAG, "config: wifi='%s' smb=//%s/%s%s user='%s' filter='%s' -> %s (dialect offer %s, seal=%d, cap=%d MB, prune=%d, dates=%+d min vs UTC)",
              s_cfg.ssid, s_cfg.srv, s_cfg.share, s_cfg.sub, s_cfg.user, s_cfg.filt, s_cfg.ldir,
-             dialect_name(s_cfg.dialect), (int)s_cfg.seal, s_cfg.max_mb, (int)s_cfg.prune);
+             dialect_name(s_cfg.dialect), (int)s_cfg.seal, s_cfg.max_mb, (int)s_cfg.prune,
+             s_cfg.tzo_min);
     return s_cfg.have_creds;
 }
 
@@ -458,6 +477,16 @@ static void provision_and_reboot(void)
                     false, "y");
         s_cfg.prune = (ans[0] != 'n' && ans[0] != 'N');
     }
+    {   /* A head unit sorts and displays by date, and this device has no clock, so the only
+         * date worth writing is the share's own - shifted to the owner's wall clock, because
+         * FAT stores no timezone. Return keeps the stored value. */
+        char ans[16];
+        snprintf(ans, sizeof(ans), "%d", s_cfg.tzo_min);
+        prompt_line("Minutes to add to card dates (60=NL winter, 120=summer, 0=UTC)", ans,
+                    sizeof(ans), false, ans);
+        s_cfg.tzo_min = atoi(ans);
+        printf("  = %+d min vs UTC\n", s_cfg.tzo_min);
+    }
 
     nvs_handle_t h;
     ESP_ERROR_CHECK(nvs_open("bridge", NVS_READWRITE, &h));
@@ -469,6 +498,7 @@ static void provision_and_reboot(void)
     nvs_set_u16(h, "del", s_cfg.prune ? 1 : 0);
     nvs_set_u16(h, "recurs", 1);
     nvs_set_u16(h, "seal", 0);
+    nvs_set_i16(h, "tzo", (int16_t)s_cfg.tzo_min);
     ESP_ERROR_CHECK(nvs_commit(h));
     nvs_close(h);
     printf("Saved. Rebooting.\n");
@@ -605,13 +635,16 @@ static void mk_parents(char *path)
     }
 }
 
-static bool card_has(const char *rel, long long *size_out)
+static bool card_has(const char *rel, long long *size_out, long long *mtime_out)
 {
     char p[PATHMAX];
     if (!card_path(p, sizeof(p), rel)) return false;
     struct stat st;
     if (stat(p, &st) != 0) return false;
     if (size_out) *size_out = (long long)st.st_size;
+    /* The naive stamp exactly as FAT holds it - this device has no zone, so stat() reads it
+     * back in the same frame utime() wrote it in, which is what makes the compare valid. */
+    if (mtime_out) *mtime_out = (long long)st.st_mtime;
     return true;
 }
 
@@ -628,6 +661,51 @@ static uint64_t card_free_bytes(void)
         return 0;
     }
     return free_bytes;
+}
+
+/* ------------------------------------------------------------- card timestamps
+ * A head unit sorts and displays by date, and a card written by a device with no clock is
+ * stamped Jan 1970 (seconds since boot), so every track lands in the same useless bucket. The
+ * share already carries the real date, and - the reason this is nearly free - the SMB2 readdir
+ * reply we parse for the name and size carries it too: de->st.smb2_mtime, in epoch seconds,
+ * because libsmb2 converts the wire FILETIME in lib/timestamps.c. No extra round trip, no
+ * extra clock; the cost is one directory write per file.
+ *
+ * Two traps. FAT stores a bare local time with no zone, and utime() on this device runs
+ * localtime_r() with no zone set, i.e. UTC - so s_cfg.tzo_min shifts the stamp onto the
+ * owner's wall clock or every date reads an hour or two off. And FAT keeps only even seconds,
+ * so a stamp that was just written never compares exactly equal to its source: without the
+ * tolerance below, every pass would find every file "wrong" and rewrite every directory entry
+ * for nothing, which on a card is wear, not just waste. Years before 1980 are refused by the
+ * FAT VFS (EINVAL), so an unusable date is left alone rather than clamped to a lie. */
+#define FAT_EPOCH_MIN  315532800ll    /* 1980-01-01: the floor FatFs accepts */
+#define FAT_EPOCH_MAX  4354732799ll   /* 2107-12-30: the top of FAT's 7-bit year */
+#define FAT_TIME_TOL_S 2              /* FAT granularity is 2 s; never compare exact */
+
+static long long s_dated_files;
+
+static bool fat_time_usable(uint64_t epoch)
+{
+    return epoch >= (uint64_t)FAT_EPOCH_MIN && epoch <= (uint64_t)FAT_EPOCH_MAX;
+}
+
+/* Does this card file need a date? have_mtime comes back in the same stamped frame, so undo
+ * the offset before comparing. A file the share gives no usable date to is left alone. */
+static bool card_date_is_off(long long have_mtime, uint64_t share_mtime)
+{
+    if (!fat_time_usable(share_mtime)) return false;
+    long long drift = have_mtime - ((long long)share_mtime + (long long)s_cfg.tzo_min * 60);
+    if (drift < 0) drift = -drift;
+    return drift > FAT_TIME_TOL_S;
+}
+
+/* path is a full card path (what card_path() builds), not a share-relative name. */
+static bool stamp_card_date(const char *path, uint64_t share_mtime)
+{
+    if (!fat_time_usable(share_mtime)) return false;
+    time_t t = (time_t)share_mtime + (time_t)s_cfg.tzo_min * 60;
+    struct utimbuf ut = { .actime = t, .modtime = t };
+    return utime(path, &ut) == 0;
 }
 
 static long long s_copied_bytes, s_copied_files, s_skipped_files;
@@ -657,6 +735,7 @@ static void write_status_file(tinyusb_msc_storage_handle_t storage, const char *
         "skipped       : %lld already present\n"
         "deferred      : %lld this run (re-run to continue)\n"
         "pruned        : %lld stale file(s); %lld kept (share did not answer)\n"
+        "dated         : %lld file(s) carry the share's own date\n"
         "volume        : %llu MiB, free %llu MiB\n"
         "host reads/wr : %lu / %lu\n"
         "free internal : %u KiB\n",
@@ -665,6 +744,7 @@ static void write_status_file(tinyusb_msc_storage_handle_t storage, const char *
         (long long)s_copied_files, (long long)s_copied_bytes, (long long)s_skipped_files,
         (long long)s_failed_files,
         (long long)s_deleted_files, (long long)s_kept_uncertain,
+        (long long)s_dated_files,
         (unsigned long long)((uint64_t)sec * ss / 1048576),
         (unsigned long long)(card_free_bytes() / 1048576),
         (unsigned long)s_host_reads, (unsigned long)s_host_writes,
@@ -750,7 +830,7 @@ static char *smb_path(char *out, size_t cap, const char *rel)
  * half-file even if the sync is cut short by the host plugging in. A transfer that runs out of
  * retries leaves the .part in place: the next sync continues from it rather than starting over.
  * See READ_STALL_RETRIES for why a failed read means a new connection, not a new file. */
-static int fetch_one(const char *smb_rel, const char *rel, uint64_t size)
+static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64_t mtime)
 {
     char sp[PATHMAX], lp[PATHMAX], tp[PATHMAX + 8];
     smb_path(sp, sizeof(sp), smb_rel);
@@ -896,6 +976,15 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size)
         ESP_LOGE(TAG, "rename %s -> %s: %s", tp, lp, strerror(errno));
         rc = ERR_CONFLICT; goto done;
     }
+    /* The share's own date, so a head unit that sorts or displays by date shows the album
+     * instead of the minute this bridge happened to copy the file. The bytes are already in
+     * place and renamed by now, so a date that will not go on is cosmetic: report it, keep it. */
+    if (stamp_card_date(lp, mtime)) {
+        s_dated_files++;
+    } else if (fat_time_usable(mtime)) {
+        ESP_LOGW(TAG, "  could not date %s: %s (the file is complete, only the date is missing)",
+                 rel, strerror(errno));
+    }
 #endif
     s_copied_files++; s_copied_bytes += (long long)off;
     ESP_LOGI(TAG, "  + %s  (%llu MB, %d reconnects, %llu files this run)", rel,
@@ -951,9 +1040,20 @@ static int walk(const char *rel_dir, int depth)
         }
         if (!matches_filter(name)) continue;
 
-        long long have = -1;
-        card_has(rel, &have);
-        if (have == (long long)de->st.smb2_size) { s_skipped_files++; continue; }
+        long long have = -1, have_mt = 0;
+        card_has(rel, &have, &have_mt);
+        if (have == (long long)de->st.smb2_size) {
+            /* Already on the card, so nothing to transfer - but a file copied before dates were
+             * carried over is stamped with this device's clock, which with no time server means
+             * Jan 1970. Fix the stamp once; card_date_is_off()'s tolerance is what stops every
+             * later pass from "repairing" the same directory entry again and again. */
+            if (card_date_is_off(have_mt, de->st.smb2_mtime)) {
+                char dp[PATHMAX];
+                if (card_path(dp, sizeof(dp), rel) && stamp_card_date(dp, de->st.smb2_mtime))
+                    s_dated_files++;
+            }
+            s_skipped_files++; continue;
+        }
 
         /* FAT will not rename a file onto a directory, so learn that before spending the
          * transfer. The card is the user's: report the clash, never delete it to make room. */
@@ -974,7 +1074,7 @@ static int walk(const char *rel_dir, int depth)
             rc = ERR_FAT;
             break;
         }
-        int frc = fetch_one(rel, rel, de->st.smb2_size);
+        int frc = fetch_one(rel, rel, de->st.smb2_size, de->st.smb2_mtime);
         if (!frc) continue;
         /* One unreachable track must not starve the rest of the library. Only the card
          * itself (full, or writes failing) or the host taking the disk back ends the walk. */
@@ -1149,6 +1249,7 @@ static int do_sync(void)
 {
     s_copied_files = s_skipped_files = s_copied_bytes = s_failed_files = 0;
     s_deleted_files = s_kept_uncertain = 0;
+    s_dated_files = 0;
 
     /* Modem sleep off, for the duration of the transfer only. The radio sleeps every DTIM
      * interval (102 ms on this AP) and the AP queues our segments meanwhile; combined with the
@@ -1179,6 +1280,10 @@ static int do_sync(void)
              rc ? "FAILED" : "done", (long long)s_copied_files,
              (long long)s_copied_bytes, (long long)s_skipped_files,
              (long long)s_failed_files, (long long)s_deleted_files);
+    /* Its own line, not a column on the one above: scripts parse that line's tail. */
+    if (s_dated_files)
+        ESP_LOGI(TAG, "dates: %lld file(s) now carry the share's own date (%+d min vs UTC)",
+                 (long long)s_dated_files, s_cfg.tzo_min);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     return rc;
 }
