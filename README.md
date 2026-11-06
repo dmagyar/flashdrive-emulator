@@ -184,9 +184,10 @@ shown, so a minimally-provisioned device works out of the box.
 | `recurs` | *(not prompted)* | `1` | recurse into subfolders; the walk depth limit is a hardcoded 8 |
 | `seal` | *(not prompted)* | `0` | force SMB3 sealing (untested against a server that requires it) |
 | `maxmb` | *(not prompted)* | `0` → 14000 | **not enforced anywhere** — see the caveat below |
+| `del` | *(not prompted)* | `1` | delete card files the share no longer has — see *Deleting what left the share* |
 
 Provisioning prompts for the ten strings and writes `recurs=1`, `seal=0` as fixed values, so the
-three integers have to be changed by an NVS write, not by answering prompts.
+four integers have to be changed by an NVS write, not by answering prompts.
 
 > **`maxmb` does nothing.** It is read from NVS, stored, and printed in the boot log
 > (`cap=%d MB`), but no code path consults it. The only capacity protection that exists is the
@@ -263,12 +264,49 @@ the file is skipped. So
 - a brand-new file, or a file missing/renamed on the card, is fetched;
 - a track you *replaced* on the share is re-fetched only if its size changed — same-size
   different-content is silently kept from the card. Delete it from the card to force a refresh;
-- **sync is additive.** Deleting or renaming on the share does not remove anything from the card.
-  After the library swap above, the card kept three orphan tracks from the old set; that is
-  expected behaviour, not corruption. Clear the card (or the folder) to prune.
+- **files that leave the share leave the card** — with `del=1` (the default) and only under the
+  guards in *Deleting what left the share* below. With `del=0` the sync is additive and orphans
+  stay forever; before that feature existed, the card kept three orphan tracks after the library
+  swap above.
 
 The bridge's own SMB account is read-only on the share, which is how it should be provisioned:
-the device can never modify or delete what is on the NAS.
+the device can never modify or delete what is on the NAS. Pruning only ever removes files from the
+card, never from the share.
+
+### Deleting what left the share
+
+`walk()` only adds. After the write phase, `prune_missing()` walks the card and removes media the
+share no longer has, so the card tracks the library instead of growing without bound. The pass
+summary reports it as its own column (`N pruned`), and the files are printed as ` - /path`.
+
+The order is not incidental: the write phase runs **first**, so a pass that reconnected and ended
+up with an empty seen-list can never be mistaken for an empty library.
+
+A card file is deleted only when every one of these holds:
+
+| guard | why it exists |
+|---|---|
+| `del=1` (default) | deletion is irreversible, so an opt-out has to exist |
+| the pass saw ≥ 1 share file | an unreachable or misconfigured share must delete nothing at all |
+| the pass was not interrupted by the host | an interrupted pass has an incomplete seen-list |
+| `smb2_stat()` answers **ENOENT** for that exact path | any other answer (a network hiccup) leaves the file and counts it as *kept-uncertain* |
+| the name matches the filter, is not `*.part`, and is not under `BRIDGE/` | the pruner touches only media it manages, never its own status file |
+| the deletion count is below half the managed files, and below a hard ceiling of 50 per pass | a mount pointed at the wrong folder looks exactly like "everything was deleted"; the cap stops one bad pass from wiping a card |
+
+When the cap stops it, the log says so and the rest wait for the next pass — the pruner
+self-converges over several passes rather than doing damage in one.
+
+Deleting in DSM normally moves a file to the share's `#recycle`. That is still the *original path*
+disappearing, so the pruner fires; `#recycle` is filtered from the walk, so a trashed track is
+never re-fetched out of the recycle bin either.
+
+This ran on the host before it ever saw hardware: `tools/prune_host_test.py` extracts
+`prune_missing()` and its helpers **from `main/bridge_main.c`** (no copy, so it cannot drift) and
+executes them against a real directory tree with a stubbed share — the file I/O is the real
+thing. 21 checks cover: stale files deleted, live files kept, `.part`/non-matching/`BRIDGE/`
+untouched, empty-share and I/O-error guards deleting nothing, the cap firing at exactly half,
+subfolders removed once empty, case differences not treated as duplicates, and an abort stopping
+the pass mid-way.
 
 ### Rules that are load-bearing
 
@@ -305,6 +343,38 @@ the device can never modify or delete what is on the NAS.
 | Wi-Fi modem sleep OFF (`WIFI_PS_NONE`) | **slower** — reverted |
 | `STATIC_RX_BUFFER_NUM` 10→25 | +2 % for 24 KiB of internal RAM — reverted |
 | writer task + two DMA slots (overlap read and write) | **tied within noise** (serial 369.5/396.4 vs overlap 414.1/400.4 KB/s on the same 61 MB library), so it was reverted. Implementation preserved in `tools/apply_overlap.py` |
+| `CONFIG_ESP_WIFI_RX_BA_WIN` 6 → 20 / 25 | **cannot be measured the naive way** — see below |
+
+> ### Why the RX BA window is not a one-knob experiment
+>
+> `esp_wifi/src/wifi_init.c` fails the **build** on an illegal pairing:
+>
+> ```c
+> #if (CONFIG_ESP_WIFI_RX_BA_WIN > CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM)
+> #error "... should not be larger than WIFI_DYNAMIC_RX_BUFFER_NUM!"
+> #if (CONFIG_ESP_WIFI_RX_BA_WIN > (CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM << 1))
+> #error "... should not be larger than double of the WIFI_STATIC_RX_BUFFER_NUM!"
+> ```
+>
+> With this project's `STATIC_RX_BUFFER_NUM=10` the largest legal window is **20**, so `=25` is not
+> testable on its own at all: it drags the buffer count with it (25/25 is the balanced maximum on a
+> non-HE chip), which costs ~24 KiB of the scarcest resource there is — internal DRAM — and that
+> buffer bump alone already measured **+2 %** and was reverted. So the arms are `20/10` (the knob
+> alone, free) and `25/25` (IDF's recommended pairing, +24 KiB), never `25/10`.
+>
+> And the trap that ate the first attempt twice: **`sdkconfig.defaults` only sets keys that are
+> absent from `sdkconfig`** — so an overlay can raise `RX_BA_WIN` but silently cannot raise
+> `STATIC_RX_BUFFER_NUM`, and the build dies on the `#error` above while looking like a config bug.
+> Each arm therefore gets its own generated config:
+>
+> ```sh
+> SDKCONFIG=$PWD/build-bawin20/sdkconfig.bawin20 \
+>   idf.py -B build-bawin20 -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.bawin20" build
+> ```
+>
+> and `tools/ba_win_matrix.sh` refuses to report a number unless the pass completed. Assert the
+> resolved value in `build-*/sdkconfig.*` before believing any throughput figure.
+
 
 `PBUF_POOL_SIZE` is not exposed in Kconfig (it lives in lwIP's `opt.h`, guarded), so it is
 overridden in the root `CMakeLists.txt`: 16 buffers × ~1480 B ≈ 23.7 KiB cannot back a 64 KiB

@@ -91,13 +91,21 @@ walk; `card_path()` no longer emits `/msc///name`.
   on this carrier**, 20 MHz. Internal DMA-capable heap is
   ~238 KiB (largest block ~160 KiB), so multi-megabyte read buffers are impossible regardless of
   what the server allows (`max read 8388608 B`).
-- **`CONFIG_ESP_WIFI_RX_BA_WIN` is still UNTESTED, and the first attempt produced a fake null
-  result.** `build.sh` runs `idf.py set-target`, which **deletes `sdkconfig` and regenerates it from
-  `sdkconfig.defaults`** — a knob that is not in `sdkconfig.defaults` does not exist. The first test
-  sed'd `sdkconfig` only, so every run in this project has used BA window 6, and the "+2%" I credited
-  to the window was really `STATIC_RX_BUFFER_NUM` 10→25 (reverted: not worth 24 KiB of internal RAM).
-  `tools/wifi_ba2_test.sh` does it correctly and **asserts the resolved value before running**, so it
-  can fail instead of reporting a fake negative. `STATIC_RX_BUFFER_NUM` caps at 25 on this chip.
+- **`CONFIG_ESP_WIFI_RX_BA_WIN`: two traps, then the constraint that decides the experiment.**
+  `build.sh` runs `idf.py set-target`, which **deletes `sdkconfig` and regenerates it from
+  `sdkconfig.defaults`** — a knob not in `sdkconfig.defaults` does not exist. The first test sed'd
+  `sdkconfig` only, so every run in this project used BA window 6, and the "+2%" I credited to the
+  window was really `STATIC_RX_BUFFER_NUM` 10→25 (reverted: not worth 24 KiB of internal RAM).
+  The opposite trap bit in 2026-11-06: **without** `set-target`, `sdkconfig.defaults` only fills
+  keys **absent** from `sdkconfig`, so an overlay raised `RX_BA_WIN` but silently could not raise
+  `STATIC_RX_BUFFER_NUM` — the build then died on the `#error` below and looked like a config bug.
+  Reliable method: one `SDKCONFIG=` file **per arm** plus the defaults chain.
+  The constraint that ends the "just set it to 25" idea: `esp_wifi/src/wifi_init.c` will not
+  **compile** if the RX BA window exceeds `DYNAMIC_RX_BUFFER_NUM` (32 here) or **twice**
+  `STATIC_RX_BUFFER_NUM` (10 here → ceiling 20). So the only legal arms are 20/10 (the knob alone,
+  free) and 25/25 (IDF's recommended pairing, +24 KiB internal DRAM); 25/10 is not a firmware.
+  `STATIC_RX_BUFFER_NUM` caps at 25 on this non-HE chip. `tools/wifi_ba2_test.sh` still asserts the
+  resolved value before running, so it fails rather than reporting a fake negative.
 - **Wi-Fi modem sleep stays on.** `WIFI_PS_NONE` (added as a guess during the stall hunt) measured
   *slower*: 254–262 KB/s vs 274–289 KB/s with `WIFI_PS_MIN_MODEM`.
 - lwIP `TCP_OOSEQ_MAX_PBUFS` / RX buffer bumps: worse. Reverted, not left in the tree.

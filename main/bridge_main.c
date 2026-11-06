@@ -9,6 +9,10 @@
  *   USB attached  -> the host owns the volume; the app never touches FAT.
  *   USB detached  -> the app takes it back, syncs from the share, hands it over again.
  *
+ * The share is the source of truth: files added there are copied to the card, and files removed
+ * there are deleted from the card (NVS key "del", on by default; see prune_missing() for the
+ * guards that keep a misconfiguration from wiping someone's library).
+ *
  * "Don't disconnect while the host is using it" is implemented as a rule the firmware can
  * actually enforce: the app never *takes* the volume away from a host. Taking requires a
  * physical DETACHED event plus a quiet period measured from the last SCSI read that passed
@@ -265,7 +269,7 @@ typedef struct {
     uint32_t dialect;     /* first offer to try; see s_dialect_tab */
     bool dialect_auto;    /* offer a range (+ fallbacks) and let the server pick its floor */
     int max_mb;
-    bool seal, recurs;
+    bool seal, recurs, prune;
     bool have_creds;      /* Wi-Fi + SMB both present */
 } cfg_t;
 
@@ -359,13 +363,17 @@ static bool cfg_load(void)
     s_cfg.recurs = (v != 0);
     if (nvs_get_u16(h, "maxmb", &v) != ESP_OK) v = 0;
     s_cfg.max_mb = v ? v : 14000;
+    /* Pruning defaults on: the share is the source of truth and a card that only ever grows
+     * turns into a library nobody can find anything in. Refuse-with-guards, not silently-off. */
+    if (nvs_get_u16(h, "del", &v) != ESP_OK) v = 1;
+    s_cfg.prune = (v != 0);
     nvs_close(h);
 
     s_cfg.dialect = dialect_parse(s_cfg.dial, &s_cfg.dialect_auto);
     s_cfg.have_creds = s_cfg.ssid[0] && s_cfg.srv[0] && s_cfg.share[0];
-    ESP_LOGI(TAG, "config: wifi='%s' smb=//%s/%s%s user='%s' filter='%s' -> %s (dialect offer %s, seal=%d, cap=%d MB)",
+    ESP_LOGI(TAG, "config: wifi='%s' smb=//%s/%s%s user='%s' filter='%s' -> %s (dialect offer %s, seal=%d, cap=%d MB, prune=%d)",
              s_cfg.ssid, s_cfg.srv, s_cfg.share, s_cfg.sub, s_cfg.user, s_cfg.filt, s_cfg.ldir,
-             dialect_name(s_cfg.dialect), (int)s_cfg.seal, s_cfg.max_mb);
+             dialect_name(s_cfg.dialect), (int)s_cfg.seal, s_cfg.max_mb, (int)s_cfg.prune);
     return s_cfg.have_creds;
 }
 
@@ -444,6 +452,12 @@ static void provision_and_reboot(void)
      * one number is what made this bridge fail against a SMB2_10-floor DSM. */
     strcpy(s_cfg.dial, "auto");
     prompt_line("SMB dialect [return = auto]", s_cfg.dial, sizeof(s_cfg.dial), false, "auto");
+    {   /* one character, because deleting media is the one answer that cannot be undone */
+        char ans[8] = "y";
+        prompt_line("Delete tracks from card when removed from share? [Y/n]", ans, sizeof(ans),
+                    false, "y");
+        s_cfg.prune = (ans[0] != 'n' && ans[0] != 'N');
+    }
 
     nvs_handle_t h;
     ESP_ERROR_CHECK(nvs_open("bridge", NVS_READWRITE, &h));
@@ -452,6 +466,7 @@ static void provision_and_reboot(void)
     nvs_set_str(h, "sub", s_cfg.sub);     nvs_set_str(h, "user", s_cfg.user);
     nvs_set_str(h, "pass", s_cfg.pass);   nvs_set_str(h, "filt", s_cfg.filt);
     nvs_set_str(h, "ldir", s_cfg.ldir);   nvs_set_str(h, "dialect", s_cfg.dial);
+    nvs_set_u16(h, "del", s_cfg.prune ? 1 : 0);
     nvs_set_u16(h, "recurs", 1);
     nvs_set_u16(h, "seal", 0);
     ESP_ERROR_CHECK(nvs_commit(h));
@@ -617,6 +632,7 @@ static uint64_t card_free_bytes(void)
 
 static long long s_copied_bytes, s_copied_files, s_skipped_files;
 static long long s_failed_files, s_dry_reads;   /* tracks left for the next run, with a .part */
+static long long s_deleted_files, s_kept_uncertain;   /* pruning, reported in the status file */
 
 static void write_status_file(tinyusb_msc_storage_handle_t storage, const char *phase, int err)
 {
@@ -640,6 +656,7 @@ static void write_status_file(tinyusb_msc_storage_handle_t storage, const char *
         "copied        : %lld file(s), %lld bytes this run\n"
         "skipped       : %lld already present\n"
         "deferred      : %lld this run (re-run to continue)\n"
+        "pruned        : %lld stale file(s); %lld kept (share did not answer)\n"
         "volume        : %llu MiB, free %llu MiB\n"
         "host reads/wr : %lu / %lu\n"
         "free internal : %u KiB\n",
@@ -647,6 +664,7 @@ static void write_status_file(tinyusb_msc_storage_handle_t storage, const char *
         s_cfg.srv, s_cfg.share, s_cfg.sub, s_cfg.user, s_cfg.filt, s_cfg.ldir,
         (long long)s_copied_files, (long long)s_copied_bytes, (long long)s_skipped_files,
         (long long)s_failed_files,
+        (long long)s_deleted_files, (long long)s_kept_uncertain,
         (unsigned long long)((uint64_t)sec * ss / 1048576),
         (unsigned long long)(card_free_bytes() / 1048576),
         (unsigned long)s_host_reads, (unsigned long)s_host_writes,
@@ -974,9 +992,163 @@ static int walk(const char *rel_dir, int depth)
     return rc;
 }
 
+
+/* ------------------------------------------------------- stale media on the card */
+/* The share is the source of truth, so a track removed there should disappear from the card too.
+ * Deleting is the one sync action that cannot be undone, so the rules are deliberately
+ * lopsided in favour of keeping:
+ *
+ *   - a file counts as gone only on a POSITIVE "no such file" from the share (-ENOENT). Any
+ *     other answer - session error, EACCES, timeout - keeps it.
+ *   - names the filter does not match were never ours to manage, so the user's own files on this
+ *     card are invisible to the pruner. Same for the BRIDGE status folder and any .part.
+ *   - a pass that saw NO files on the share prunes nothing at all. That single guard is what
+ *     stops a wrong 'sub', an emptied share, or a changed filter from reading as "the user
+ *     deleted the whole library".
+ *   - at most half of the card's managed files, and never more than PRUNE_MAX_FILES, go in one
+ *     pass. The ceiling is the guard that matters: a badly misconfigured path otherwise reads as
+ *     "the user deleted everything", and half of a 400-file library is a lot to lose at once.
+ *     Small libraries converge over a few passes; the log says when to re-run.
+ */
+#define PRUNE_MAX_FILES 50
+static bool s_prune_cap_hit;
+
+static bool name_ends_ci(const char *name, const char *suffix)
+{
+    size_t n = strlen(name), s = strlen(suffix);
+    if (n < s) return false;
+    for (size_t i = 0; i < s; i++)
+        if (tolower((unsigned char)name[n - s + i]) != tolower((unsigned char)suffix[i])) return false;
+    return true;
+}
+
+/* True = keep it. libsmb2's sync wrappers return -nterror_to_errno(status), so -ENOENT covers
+ * NO_SUCH_FILE, OBJECT_NAME_NOT_FOUND and OBJECT_PATH_NOT_FOUND alike (lib/errors.c). */
+static bool share_still_has(const char *rel)
+{
+    char sp[PATHMAX];
+    smb_path(sp, sizeof(sp), rel);
+    struct smb2_stat_64 st;
+    int rc = smb2_stat(s_smb, sp, &st);
+    if (rc == 0) return true;
+    if (rc == -ENOENT) return false;
+    s_kept_uncertain++;
+    ESP_LOGW(TAG, "  keeping %s: the share would not answer (%d %s)", rel, rc, smb2_get_error(s_smb));
+    return true;
+}
+
+/* Is this card entry something the pruner is allowed to manage? */
+static bool prunable(const char *rel_dir, const char *name, int depth, char *rel, size_t relcap,
+                     char *full, size_t fullcap)
+{
+    if (!strcmp(name, ".") || !strcmp(name, "..")) return false;
+    if (depth == 0 && !strcmp(name, "BRIDGE")) return false;    /* our own status folder */
+    rel_join(rel, relcap, rel_dir, name);      /* void; sets rel[0]=0 if it did not fit */
+    if (!rel[0]) return false;
+    if (!card_path(full, fullcap, rel)) return false;
+    return true;
+}
+
+static long long count_prunable(const char *rel_dir, int depth)
+{
+    char base[PATHMAX];
+    if (!card_path(base, sizeof(base), rel_dir)) return 0;
+    DIR *d = opendir(base);
+    if (!d) return 0;
+    long long total = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        char rel[PATHMAX], full[PATHMAX];
+        if (!prunable(rel_dir, de->d_name, depth, rel, sizeof(rel), full, sizeof(full))) continue;
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < s_depth_limit) total += count_prunable(rel, depth + 1);
+        } else if (!name_ends_ci(de->d_name, ".part") && matches_filter(de->d_name)) {
+            total++;
+        }
+    }
+    closedir(d);
+    return total;
+}
+
+/* Post-order: a directory is only considered once its own stale children are gone. */
+static void prune_dir(const char *rel_dir, int depth, long long cap)
+{
+    char base[PATHMAX];
+    if (!card_path(base, sizeof(base), rel_dir)) return;
+    DIR *d = opendir(base);
+    if (!d) return;                                    /* vanished under us */
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (s_abort) break;                            /* the host wants its disk back */
+        char rel[PATHMAX], full[PATHMAX];
+        if (!prunable(rel_dir, de->d_name, depth, rel, sizeof(rel), full, sizeof(full))) continue;
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < s_depth_limit) prune_dir(rel, depth + 1, cap);
+            DIR *e = opendir(full);
+            bool empty = false;
+            if (e) {
+                struct dirent *ke;
+                empty = true;
+                while ((ke = readdir(e)) != NULL)
+                    if (strcmp(ke->d_name, ".") && strcmp(ke->d_name, "..")) { empty = false; break; }
+                closedir(e);
+            }
+            if (empty && !share_still_has(rel)) {
+                if (rmdir(full) == 0) {
+                    s_deleted_files++;
+                    ESP_LOGI(TAG, "  - %s/  (gone from the share)", rel);
+                } else {
+                    ESP_LOGE(TAG, "  rmdir %s: %s", rel, strerror(errno));
+                }
+            }
+            continue;
+        }
+
+        if (name_ends_ci(de->d_name, ".part") || !matches_filter(de->d_name)) continue;
+        if (share_still_has(rel)) continue;
+        /* Checked here, not at the top of the loop: the flag should mean "we found more stale
+         * files than this pass was willing to delete", not "some other entry was still waiting". */
+        if (s_deleted_files >= cap) { s_prune_cap_hit = true; continue; }
+        if (unlink(full) != 0) {
+            ESP_LOGE(TAG, "  unlink %s: %s", rel, strerror(errno));   /* never count it */
+            continue;
+        }
+        s_deleted_files++;
+        ESP_LOGI(TAG, "  - %s  (gone from the share)", rel);
+    }
+    closedir(d);
+}
+
+static void prune_missing(long long share_seen)
+{
+    if (!s_cfg.prune) return;
+    if (share_seen <= 0) {
+        ESP_LOGW(TAG, "prune skipped: the share yielded no files this pass (mis-set 'sub' or filter?)");
+        return;
+    }
+    long long card = count_prunable("/", 0);
+    if (card <= 0) return;
+    long long cap = (card + 1) / 2;          /* half, rounded up: one stale file must be deletable */
+    if (cap > PRUNE_MAX_FILES) cap = PRUNE_MAX_FILES;
+    s_prune_cap_hit = false;
+    prune_dir("/", 0, cap);
+    if (s_deleted_files)
+        ESP_LOGI(TAG, "prune: %lld stale file(s) removed of %lld managed (%lld kept, share silent)",
+                 s_deleted_files, card, s_kept_uncertain);
+    if (s_prune_cap_hit)
+        ESP_LOGW(TAG, "prune stopped at its safety cap (%lld of %lld): re-run to continue, or set del=0",
+                 s_deleted_files, card);
+}
+
 static int do_sync(void)
 {
     s_copied_files = s_skipped_files = s_copied_bytes = s_failed_files = 0;
+    s_deleted_files = s_kept_uncertain = 0;
 
     /* Modem sleep off, for the duration of the transfer only. The radio sleeps every DTIM
      * interval (102 ms on this AP) and the AP queues our segments meanwhile; combined with the
@@ -996,13 +1168,17 @@ static int do_sync(void)
     s_state = ST_SYNC;
     ESP_LOGI(TAG, "sync start: //%s/%s%s -> %s (filter '%s')", s_cfg.srv, s_cfg.share,
              s_cfg.sub, s_cfg.ldir, s_cfg.filt);
+    long long share_seen = 0;
     rc = walk("/", 0);
+    /* What the share offered this pass: the guard prune_missing() refuses to work without. */
+    share_seen = s_copied_files + s_skipped_files;
+    if (!rc && !s_abort) prune_missing(share_seen);
     smb_close();
     write_status_file(s_storage, rc ? "sync-failed" : "sync-done", rc);
-    ESP_LOGI(TAG, "sync %s: %lld copied (%lld bytes), %lld already present, %lld deferred",
+    ESP_LOGI(TAG, "sync %s: %lld copied (%lld bytes), %lld already present, %lld deferred, %lld pruned",
              rc ? "FAILED" : "done", (long long)s_copied_files,
              (long long)s_copied_bytes, (long long)s_skipped_files,
-             (long long)s_failed_files);
+             (long long)s_failed_files, (long long)s_deleted_files);
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     return rc;
 }

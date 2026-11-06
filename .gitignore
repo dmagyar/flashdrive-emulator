@@ -25,3 +25,7 @@ tools/interleave_probe
 tools/test_smb_path
 tools/*.o
 *.part
+
+# A/B arm images and per-arm build dirs (tools/ba_win_build.sh).
+dist/
+build-*/
