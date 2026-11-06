@@ -32,6 +32,9 @@ for d in /sys/bus/usb/devices/*; do
 done
 [ -n "$D" ] || bail "no ESP32 USB device on the host"
 DAUTH="$D/authorized"
+# A bail must not leave the bench hostage: this script de-authorizes the device, and a failure
+# before the hand-back step leaves the bridge owning the volume with no /dev/sdb on the host.
+trap 'echo 1 > "$DAUTH" 2>/dev/null' EXIT INT TERM
 PORT=$(ls /dev/serial/by-id/*1a86* 2>/dev/null | head -1)
 [ -n "$PORT" ] || bail "no console port"
 
@@ -75,12 +78,18 @@ sleep 3; kill $CATPID 2>/dev/null || true
 grep -a "sync start:\|  - \|prune\|sync done:\|sync FAILED:" "$LOG" | sed 's/^/  /'
 
 echo "=== 3. what the firmware says it did ==="
-PRUNED=$(grep -a "prune:" "$LOG" | tail -1 | sed -n 's/.*prune: \([0-9]*\) stale.*/\1/p')
-SUMMARY=$(grep -a "sync done:" "$LOG" | tail -1 | sed -n 's/.*\([0-9]*\) pruned.*/\1/p')
-LINES=$(grep -ac "^.\{0,40\}  - /PRUNE-TEST" "$LOG" || true)
+# Strip CR first - every console line ends in CR, and a `.*` before a `\([0-9]*\)` capture happily
+# matches up to " pruned" and captures nothing, so an empty string looks like a missing column.
+LOGC=/tmp/prune_proof.clean
+tr -d '\r' < "$LOG" > "$LOGC"
+PRUNED=$(sed -n 's/.*prune: \([0-9][0-9]*\) stale.*/\1/p' "$LOGC" | tail -1)
+SUMMARY=$(sed -n 's/.*, \([0-9][0-9]*\) pruned$/\1/p' "$LOGC" | tail -1)
+LINES=$(grep -c "  - /PRUNE-TEST" "$LOGC" || true)
 say "prune line says ${PRUNED:-none}; summary column says ${SUMMARY:-none}; per-file removals: $LINES"
 [ "${PRUNED:-0}" = "$N" ] || bail "expected $N pruned, firmware reported ${PRUNED:-nothing}"
-[ "${SUMMARY:-}" = "$N" ] || bail "the summary's pruned column (${SUMMARY:-absent}) disagrees with the prune line ($PRUNED) - reporting is lying"
+[ "${SUMMARY:-}" = "$N" ] || bail "the summary's pruned column (${SUMMARY:-empty}) disagrees with the prune line ($PRUNED) - reporting is lying"
+[ "$LINES" = "$N" ] || bail "$LINES per-file removal lines, expected $N - the count and the log disagree"
+grep -q "  - /PRUNE-KEEP" "$LOGC" && bail "the log shows a decoy being removed"
 
 echo "=== 4. what the card actually looks like ==="
 echo 1 > "$DAUTH"

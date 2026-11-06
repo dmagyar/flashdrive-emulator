@@ -303,10 +303,26 @@ never re-fetched out of the recycle bin either.
 This ran on the host before it ever saw hardware: `tools/prune_host_test.py` extracts
 `prune_missing()` and its helpers **from `main/bridge_main.c`** (no copy, so it cannot drift) and
 executes them against a real directory tree with a stubbed share — the file I/O is the real
-thing. 21 checks cover: stale files deleted, live files kept, `.part`/non-matching/`BRIDGE/`
-untouched, empty-share and I/O-error guards deleting nothing, the cap firing at exactly half,
-subfolders removed once empty, case differences not treated as duplicates, and an abort stopping
-the pass mid-way.
+thing. 26 checks cover: stale files deleted, live files kept, `.part`/non-matching/`BRIDGE/`
+untouched, empty-share and I/O-error guards deleting nothing, the cap firing at half (and at the
+50-file ceiling), subfolders removed once empty, case differences not treated as duplicates, an
+abort stopping the pass, and a pass that deletes exactly its allowance raising no cap warning.
+
+**Proven on the card** by `tools/prune_proof.sh 3` — three 1 MiB `.mp3` files the share never saw,
+plus three decoys, then one detach cycle:
+
+```
+I (236151) bridge:   - /PRUNE-TEST-01.mp3  (gone from the share)
+I (236302) bridge:   - /PRUNE-TEST-02.mp3  (gone from the share)
+I (236348) bridge:   - /PRUNE-TEST-03.mp3  (gone from the share)
+I (236454) bridge: prune: 3 stale file(s) removed of 13 managed (0 kept, share silent)
+I (236525) bridge: sync done: 0 copied (0 bytes), 10 already present, 0 deferred, 3 pruned
+```
+
+and the card itself, re-mounted read-only afterwards: all three orphans gone, all three decoys
+(`.jpg`, `.part`, `BRIDGE/`-inside) present, and the ten real tracks byte-for-byte identical in
+size. That last check is the one the test exists for — deleting the planted files is the easy
+half, leaving the library alone is the property that must not regress.
 
 ### Rules that are load-bearing
 
