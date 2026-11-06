@@ -268,7 +268,7 @@ static sdmmc_card_t *sd_open(esp_blockdev_handle_t *bdl)
  * can build with -DBRIDGE_TZO_DEFAULT=60 and never think about it again. Defined here because
  * config_load() reads it long before the timestamp code that applies it. */
 #ifndef BRIDGE_TZO_DEFAULT
-#define BRIDGE_TZO_DEFAULT 0
+#define BRIDGE_TZO_DEFAULT 60   /* Netherlands, winter time. +120 in summer; 'tzo' in NVS wins */
 #endif
 
 /* Dated-archive retention, in date folders, used only until NVS has a "keepd" key. 0 turns the
@@ -1686,8 +1686,15 @@ void app_main(void)
         .medium.blockdev = bdl,
         .fat_fs = {
             .base_path = (char *)MSC_PATH,
-            .config = { .max_files = 8, .format_if_mount_failed = true, .allocation_unit_size = 8192 },
-            .do_not_format = false,
+            /* Never format on a failed mount. A mount failure is the moment the volume is at its
+             * most questionable - MBR'd card, partial write, card edge failing - and formatting
+             * then silently destroys the owner's whole music library with no prompt and no log
+             * beyond the mount error. On a bench that is an inconvenience; in a car, where the
+             * card survives ignition glitches and the owner cannot read the console, it is an
+             * unrecoverable data-loss path with no warning. Refuse the card instead (LED: red,
+             * 6 blinks) and let a human format it deliberately. */
+            .config = { .max_files = 8, .format_if_mount_failed = false, .allocation_unit_size = 8192 },
+            .do_not_format = true,
             .format_flags = 0,
         },
         .mount_point = TINYUSB_MSC_STORAGE_MOUNT_APP,   /* we start as owner */

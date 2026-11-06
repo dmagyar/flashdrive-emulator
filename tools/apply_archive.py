@@ -35,13 +35,16 @@ def edit(old, new, marker=None):
 
 
 # ------------------------------------------------------------------ config: the knob
+# Baseline note: this anchor is the tzo block as it stands in the commit the archive layer is
+# derived from. When that block changes (its default value, its comment), update BOTH sides here -
+# silently re-anchoring on a looser match is how a patcher starts shipping an old default.
 edit(
     """#ifndef BRIDGE_TZO_DEFAULT
-#define BRIDGE_TZO_DEFAULT 0
+#define BRIDGE_TZO_DEFAULT 60   /* Netherlands, winter time. +120 in summer; 'tzo' in NVS wins */
 #endif
 """,
     """#ifndef BRIDGE_TZO_DEFAULT
-#define BRIDGE_TZO_DEFAULT 0
+#define BRIDGE_TZO_DEFAULT 60   /* Netherlands, winter time. +120 in summer; 'tzo' in NVS wins */
 #endif
 
 /* Dated-archive retention, in date folders, used only until NVS has a "keepd" key. 0 turns the

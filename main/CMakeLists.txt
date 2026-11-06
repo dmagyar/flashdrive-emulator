@@ -17,3 +17,14 @@ idf_component_register(
         esp_wifi
         lwip
 )
+
+# Per-build defaults the firmware uses when NVS holds no answer yet (timezone offset, archive
+# depth). `-DBRIDGE_TZO_DEFAULT=60` on the idf.py command line only creates a CMake CACHE
+# variable - it is never turned into a preprocessor define, so a build that believed it carried
+# 60 shipped the hardcoded 0 instead (proven: the identifier occurred zero times in
+# build/compile_commands.json, while the log line reported "+0 min vs UTC"). Forward them.
+foreach(_bridge_var BRIDGE_TZO_DEFAULT BRIDGE_KEEP_DAYS_DEFAULT)
+    if(DEFINED ${_bridge_var})
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE "${_bridge_var}=${${_bridge_var}}")
+    endif()
+endforeach()

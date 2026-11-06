@@ -22,7 +22,12 @@
 set -eu
 LOG=${1:-refile.log}
 PORT=$(ls /dev/serial/by-id/*1a86* | head -1)
-DEV=/dev/sdX
+# Resolve the card by VENDOR, never by "the first vfat". This bench has a 1.9 GB CHIPSBNK vfat
+# stick next to the bridge's 14.8 GB TinyUSB volume, so a positional guess would have mounted -
+# and then flattened - somebody else's disk. Exactly one match or nothing runs.
+DEV=$(lsblk -rpno NAME,VENDOR 2>/dev/null | awk '$2=="TinyUSB"{print $1}')
+[ "$(printf '%s\n' "$DEV" | grep -c .)" = "1" ] || { echo "FAIL: want exactly one TinyUSB volume, got [$DEV]"; exit 1; }
+echo "card = $DEV"
 AUTH=/sys/bus/usb/devices/1-1.5/authorized
 MNT=/mnt/car
 [ -n "$PORT" ] || { echo "no 1a86 console port"; exit 1; }
