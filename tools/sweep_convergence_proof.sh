@@ -129,6 +129,10 @@ if [ "${PREFLIGHT:-0}" = "1" ]; then
 fi
 
 echo "== flash $BIN =="
+# Record WHICH BYTES go into flash: a proof belongs to the image in the chip, not to the source tree,
+# and the bench deletes the copy it was handed. Without this line the question "did the board really
+# run the build under test?" is unanswerable after the run.
+echo "image sha256: $(sha256sum "$BIN" | cut -d' ' -f1)  size: $(stat -c %s "$BIN")"
 authorize 1 || true
 esptool --chip esp32s3 -p "$PORT" --before default-reset --after no-reset \
         write_flash 0x20000 "$BIN" 2>&1 | tail -2
