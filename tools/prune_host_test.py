@@ -54,7 +54,8 @@ static char MSC_PATH_buf[512];
 #define MSC_PATH MSC_PATH_buf
 
 /* --- what the firmware gets from ESP-IDF / NVS --- */
-typedef struct { char filt[64]; char ldir[64]; int max_mb; bool prune, recurs, seal; } cfg_t;
+typedef struct { char filt[64]; char ldir[64]; int max_mb; int tzo_min; int keep_days;
+                 bool prune, recurs, seal; } cfg_t;
 static cfg_t s_cfg;
 static volatile bool s_abort;
 static int s_depth_limit = 8;
@@ -246,6 +247,25 @@ int main(void)
     s_abort = true;
     prune_missing(1);
     check(s_deleted_files == 0, "nothing deleted once the host wanted the volume");
+
+    printf("\n[12] the pruner stands down while the dated archive is on\n");
+    reset();
+    s_cfg.keep_days = 6;                        /* archive mode: retention is by folder date */
+    touch("/gone1.mp3"); touch("/gone2.mp3");   /* neither exists on the share */
+    prune_missing(4);                           /* share_seen > 0, prune on, so only the mode stops it */
+    check(s_deleted_files == 0,
+          "nothing deleted: a rolling share really does not have the files it rotated out, "
+          "so its answers must not drive deletion here");
+    check(exists("/gone1.mp3") && exists("/gone2.mp3"), "both archived files survive the call");
+    s_cfg.keep_days = 0;                        /* back to mirror semantics */
+    s_deleted_files = 0;                        /* as a fresh sync pass would (do_sync zeroes it) */
+    prune_missing(4);
+    check(s_deleted_files == 1,
+          "with keepd=0 the mirror is back, and prunes at its own cap (half of 2 managed)");
+    s_deleted_files = 0;                        /* the next pass starts with a clean tally */
+    prune_missing(4);                           /* cap-limited passes converge */
+    check(s_deleted_files == 1 && !exists("/gone1.mp3") && !exists("/gone2.mp3"),
+          "the second pass finishes the job the archive had refused to start");
 
     printf("\n%d checks, %d failed (%d share stat queries overall)\n", g_checks, g_fail, g_stat_total);
     return g_fail ? 1 : 0;

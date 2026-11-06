@@ -1,0 +1,84 @@
+#!/bin/sh
+# Dated-archive proof, run ON THE BENCH.
+#
+#   sh archive_proof.sh <bridge.bin> <log-name> [max-seconds]
+#
+# Flashes the image, lets the board take the volume back, waits for its own report, hands the
+# volume back to the host, and prints the lines that decide the claim:
+#
+#   filed  ...  (same bytes: a directory write, not a transfer)   <- migration by rename
+#   sync done: 0 copied (0 bytes), N already present              <- nothing re-downloaded
+#   prune skipped: dated archive on                               <- pruner stood down
+#
+# Three rules this encodes, each learned the hard way on this bench:
+#   * capture with `cat` on the tty after `stty raw -echo`. pyserial is forbidden: its open()
+#     pulses DTR/RTS, resets the board and destroys the DETACHED window mid-transfer.
+#   * an app-only flash leaves the board in the bootloader; a second esptool with
+#     --after hard-reset is what actually starts the app before listening.
+#   * never hand the volume back on a timer. Wait for 'sync done:' / 'sync FAILED:' or a
+#     bail-out is announced, or the harness itself aborts the transfer it is measuring.
+# The EXIT trap hands the volume back whatever happens, so a bail-out cannot leave the bench
+# holding a disk the host can no longer see.
+set -eu
+BIN=$1; LOG=$2; MAX=${3:-1500}
+PORT=$(ls /dev/serial/by-id/*1a86* | head -1)
+[ -n "$PORT" ] || { echo "no 1a86 console port"; exit 1; }
+[ -f "$BIN" ] || { echo "no image at $BIN"; exit 1; }
+
+D=""
+for d in /sys/bus/usb/devices/*; do
+    [ -e "$d/idVendor" ] || continue
+    [ "$(cat "$d/idVendor" 2>/dev/null)" = 303a ] && D=$d
+done
+[ -n "$D" ] || { echo "ESP32 not on the bus"; exit 1; }
+DAUTH="$D/authorized"
+
+authorize () {
+    i=0
+    while [ "$i" -lt 10 ]; do
+        if echo "$1" > "$DAUTH" 2>/dev/null; then
+            [ "$(cat "$DAUTH" 2>/dev/null)" = "$1" ] && return 0
+        fi
+        i=$((i + 1)); sleep 2
+    done
+    echo "  WARN: authorized=$1 not reached (now $(cat "$DAUTH" 2>/dev/null))"
+    return 1
+}
+# Hand the disk back on any exit path, including a control-C here.
+trap 'authorize 1 >/dev/null 2>&1 || true' EXIT INT TERM
+
+echo "== flash $BIN =="
+authorize 1 || true
+esptool --chip esp32s3 -p "$PORT" --before default-reset --after no-reset \
+        write_flash 0x20000 "$BIN" 2>&1 | tail -2
+# The flash leaves it in the bootloader; this reset is what boots the app.
+esptool --chip esp32s3 -p "$PORT" --before default-reset --after hard-reset \
+        flash-id >/dev/null 2>&1
+sleep 8
+
+stty -F "$PORT" 115200 raw -echo
+: > "/tmp/$LOG"
+nohup timeout $((MAX + 180)) cat "$PORT" > "/tmp/$LOG" 2>/dev/null &
+CAT=$!
+sleep 1
+authorize 0                                  # the host lets go; the bridge runs a pass
+i=0; done_=0
+while [ "$i" -lt "$MAX" ]; do
+    if grep -aq 'sync done:\|sync FAILED:' "/tmp/$LOG"; then done_=1; break; fi
+    if [ $((i % 60)) -eq 0 ]; then
+        last=$(tr -d '\r' < "/tmp/$LOG" | grep -a ' bridge: ' | tail -1 | cut -c1-78)
+        echo "  [${i}s] ${last:-waiting for the bridge to start its pass}"
+    fi
+    sleep 5; i=$((i + 5))
+done
+sleep 2
+kill "$CAT" 2>/dev/null
+[ "$done_" = 1 ] || echo "  BAILOUT: pass still running after ${MAX}s - hand-back forced"
+authorize 1
+trap - EXIT INT TERM
+i=0
+while [ ! -b /dev/sdb ] && [ "$i" -lt 40 ]; do sleep 1; i=$((i + 1)); done
+
+echo "== the bridge's own report =="
+tr -d '\r' < "/tmp/$LOG" | grep -aE 'config:|filed |retired |archive:|dates:|prune |sync done:|sync FAILED' \
+    | sed -e 's/^I ([0-9]*) bridge:/  /' -e 's/^W ([0-9]*) bridge:/  W /'

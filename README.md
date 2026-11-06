@@ -185,9 +185,11 @@ shown, so a minimally-provisioned device works out of the box.
 | `seal` | *(not prompted)* | `0` | force SMB3 sealing (untested against a server that requires it) |
 | `maxmb` | *(not prompted)* | `0` → 14000 | **not enforced anywhere** — see the caveat below |
 | `del` | *(not prompted)* | `1` | delete card files the share no longer has — see *Deleting what left the share* |
+| `tzo` | Minutes to add to card dates | `BRIDGE_TZO_DEFAULT` (0 = UTC) | FAT stores no timezone; 60 = Netherlands in winter. Applies to both the stamp and the date folder |
+| `keepd` | Date folders to keep | `BRIDGE_KEEP_DAYS_DEFAULT` (6) | the dated archive: `YYYYMMDD` folders retained, oldest retired. `0` = flat mirror of the share |
 
-Provisioning prompts for the ten strings and writes `recurs=1`, `seal=0` as fixed values, so the
-four integers have to be changed by an NVS write, not by answering prompts.
+Provisioning prompts for the ten strings plus `tzo` and `keepd`, and writes `recurs=1`, `seal=0` as
+fixed values, so those two integers have to be changed by an NVS write, not by answering prompts.
 
 > **`maxmb` does nothing.** It is read from NVS, stored, and printed in the boot log
 > (`cap=%d MB`), but no code path consults it. The only capacity protection that exists is the
@@ -273,6 +275,41 @@ The bridge's own SMB account is read-only on the share, which is how it should b
 the device can never modify or delete what is on the NAS. Pruning only ever removes files from the
 card, never from the share.
 
+### The dated archive (`keepd`)
+
+The share this box syncs from is a **rolling buffer**: the recorder on the NAS keeps the last ten
+30-minute chunks named `01.mp3 .. 10.mp3` and shifts every name down one slot when a chunk
+finishes (`recorder.py:4-8`). A mirror that identifies a track by its *name* therefore
+re-downloads the whole window on every rotation — measured on this bench as **430 MB written to the
+card for 43 MB of new audio**, i.e. ten times the write wear for ten times nothing. On a card
+behind a 1-bit SD bus, that is the difference between years of life and months.
+
+With `keepd > 0` (the default) the bridge files each track by **what it is** rather than what it is
+called:
+
+| | |
+|---|---|
+| identity | the `(size, mtime)` pair the SMB2 `readdir` reply already carries — no extra round trip |
+| placement | `MUSIC/YYYYMMDD/<name>`, the date taken from the share's own mtime in the owner's zone (`tzo`), so the folder and the date the head unit shows cannot disagree |
+| already have it? | look for those bytes anywhere on the card; found under an older name → `rename(2)` it. FatFs moves a file between directories by rewriting the **directory entry**, so no megabytes cross the Wi-Fi and no clusters are reallocated |
+| retention | keep the newest `keepd` date folders, retire the oldest whole folder — decided by the **card's own calendar**, so a network that is down cannot delete anything |
+| card full | retire the single oldest folder and retry the file, one folder per file rather than clearing the card in a bad moment |
+| `keepd = 0` | the old flat mirror, name-matched, with share-driven deletion |
+
+Two consequences worth being explicit about:
+
+- **The first archive pass downloads nothing.** The tracks already on the card are *filed*, not
+  fetched — the same inode under a new name. The status line reads
+  `filed … (same bytes: a directory write, not a transfer)`.
+- **`del` stands down while the archive is on.** The share genuinely does not hold the files it
+  rotated out an hour ago, so letting its answers drive deletion would empty the card within two
+  passes. The log says `prune skipped: dated archive on (N folder(s))`. Deletion here is
+  `archive_retire_to()`, driven by folder dates.
+
+`tools/archive_host_test.py` exercises this on the host against a real directory tree (41 checks) —
+including the inode assertion that proves filing moves no data, and the guard-rail cases where a
+retirement must *not* happen.
+
 ### Deleting what left the share
 
 `walk()` only adds. After the write phase, `prune_missing()` walks the card and removes media the
@@ -287,6 +324,7 @@ A card file is deleted only when every one of these holds:
 | guard | why it exists |
 |---|---|
 | `del=1` (default) | deletion is irreversible, so an opt-out has to exist |
+| `keepd=0` | in archive mode the share's answers are not evidence — see *The dated archive* above |
 | the pass saw ≥ 1 share file | an unreachable or misconfigured share must delete nothing at all |
 | the pass was not interrupted by the host | an interrupted pass has an incomplete seen-list |
 | `smb2_stat()` answers **ENOENT** for that exact path | any other answer (a network hiccup) leaves the file and counts it as *kept-uncertain* |

@@ -20,7 +20,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 CONFIG_FREERTOS_HZ=1000
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# The sync runs in the main task: walk() holds five PATHMAX(512) buffers per frame and recurses,
+# and the dated archive adds a search-and-rename chain (opendir/readdir/stat through the VFS) to
+# every file the walk has not already matched. At 8 KiB that overflowed - "A stack overflow in
+# task main", reboot loop - which is what the stack_min= field on the status line exists to prove.
+# 12 KiB with the archive's path scratch in .bss rather than on the stack.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
 
 # USB Device on the native OTG peripheral (GPIO19 D-, GPIO20 D+), MSC class only.
 CONFIG_TINYUSB_MSC_ENABLED=y
