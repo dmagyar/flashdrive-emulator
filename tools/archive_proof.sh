@@ -22,6 +22,19 @@
 set -eu
 BIN=$1; LOG=$2; MAX=${3:-1500}
 PORT=$(ls /dev/serial/by-id/*1a86* | head -1)
+
+# ONE harness owns the bench. A second script that writes .../authorized can abort the first
+# one's transfer from halfway across the room, and the aborted pass reports the *firmware* as
+# failed: a leftover harness from an earlier attempt fired its forced hand-back 11 minutes into
+# this proof and turned a healthy sync into "sync FAILED: 5 copied". The port has no owner field,
+# so the mutex has to be the harness's own discipline. Held for the script's lifetime on fd 9.
+exec 9>/tmp/bridge.lock
+if ! flock -n 9; then
+    echo "REFUSING TO RUN: another bench harness holds /tmp/bridge.lock." >&2
+    echo "It will hand the volume back mid-pass and invalidate this run." >&2
+    ps -eo pid,etime,cmd | grep -E 'archive_proof|one_pass|dates_legs|repair_v|prune_proof' | grep -v grep >&2
+    exit 1
+fi
 [ -n "$PORT" ] || { echo "no 1a86 console port"; exit 1; }
 [ -f "$BIN" ] || { echo "no image at $BIN"; exit 1; }
 
