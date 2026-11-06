@@ -177,9 +177,9 @@ int main(void)
         char out[PATHMAX];
         cfg(6, 60);
         archive_target(out, sizeof(out), "/08.mp3", (long long)T_DAY);
-        check(!strcmp(out, "20261106/08.mp3"), "dated file lands in its own YYYYMMDD folder");
+        check(!strcmp(out, "20261106/090000_08.mp3"), "dated file lands in its own YYYYMMDD folder, named by its own start time");
         archive_target(out, sizeof(out), "/rock/08.mp3", (long long)T_DAY);
-        check(!strcmp(out, "20261106/08.mp3"), "the share's folder structure does not follow it in");
+        check(!strcmp(out, "20261106/090000_08.mp3"), "the share's folder structure does not follow it in");
         archive_target(out, sizeof(out), "/08.mp3", 0);
         check(!strcmp(out, "/08.mp3"), "a share with no usable date keeps the flat name");
         cfg(0, 60);
@@ -187,8 +187,19 @@ int main(void)
         check(!strcmp(out, "/08.mp3"), "keepd=0 (mirror mode) leaves the path alone");
         cfg(6, 60);
         archive_target(out, sizeof(out), "/09.mp3", (long long)T_DAY_2330Z);
-        check(!strcmp(out, "20261107/09.mp3"),
-              "23:30 UTC files on the 7th at UTC+1: the boundary follows the owner's clock");
+        check(!strcmp(out, "20261107/083000_09.mp3"),
+              "the day boundary follows the owner's clock, not UTC");
+
+        /* The reason the name carries the time: the recorder's names are positional and recycle
+         * every half hour, so two chunks of one day arrive as the same share name. Filed by
+         * name alone they collide and the second can never be filed (measured on the bench:
+         * 6 of 10 deferred with a healthy network). Different paths for both is the contract. */
+        char first[PATHMAX], second[PATHMAX];
+        archive_target(first, sizeof(first), "/07.mp3", (long long)T_DAY);
+        archive_target(second, sizeof(second), "/07.mp3", (long long)T_DAY + 1800);
+        check(strcmp(first, second) != 0, "two chunks that share the name 07.mp3 get different card paths");
+        check(strstr(first, "07.mp3") && strstr(second, "07.mp3"),
+              "the share's name stays visible in both, so the head unit still shows 07");
     }
 
     printf("\n3. same_track: is this the same recording\n");

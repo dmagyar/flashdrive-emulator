@@ -805,6 +805,25 @@ static bool archive_day_value(const char *name, int *day_out)
     return true;
 }
 
+/* `HHMMSS_basename` - unique per chunk within a day (two chunks cannot start the same second),
+ * chronologically sortable, and keeps the share's name visible. 8.3 names are shortened to stay
+ * inside the card's per-segment budget. */
+static bool archive_stamped_name(char *out, size_t outlen, long long mtime, const char *base)
+{
+    time_t t = (time_t)mtime + (long long)s_cfg.tzo_min * 60;
+    struct tm tm_local;
+    if (!localtime_r(&t, &tm_local)) return false;
+    char stem[12];
+    const char *dot = strrchr(base, '.');
+    size_t stem_len = dot ? (size_t)(dot - base) : strlen(base);
+    if (stem_len >= sizeof(stem)) stem_len = sizeof(stem) - 1;
+    memcpy(stem, base, stem_len);
+    stem[stem_len] = 0;
+    int n = snprintf(out, outlen, "%02d%02d%02d_%.12s%s", tm_local.tm_hour, tm_local.tm_min,
+                     tm_local.tm_sec, stem, dot ? dot : "");
+    return n > 0 && (size_t)n < outlen;
+}
+
 /* The card-relative path this share entry owns. With no usable date there is no honest folder to
  * put it in, so it lands where the mirror would have put it - same file, same name, no orphan. */
 static void archive_target(char *out, size_t cap, const char *rel, long long mtime)
@@ -816,19 +835,40 @@ static void archive_target(char *out, size_t cap, const char *rel, long long mti
         strlcpy(out, rel, cap);
         return;
     }
-    snprintf(out, cap, "%s/%s", day, base);
+    /* The day folder alone is not enough, because the recorder's names are POSITIONAL: 07.mp3 is
+     * "the third-newest chunk", so a new chunk arrives under a name the card filed hours ago with
+     * completely different bytes. Filing by name alone collides with an earlier chunk of the same
+     * day, and the collision is resolved by deferring - so after a few hours most of the share
+     * cannot be filed at all (measured on the bench: 6 of 10 deferred, 0 copied, no network
+     * fault). The chunk's own start time is unique within its day, so it leads the name: the
+     * folder still groups by day, entries sort chronologically, and the share's name stays for
+     * the head unit to show. */
+    char stamp[32];
+    if (!archive_stamped_name(stamp, sizeof(stamp), mtime, base)) {
+        strlcpy(out, rel, cap);
+        return;
+    }
+    snprintf(out, cap, "%s/%s", day, stamp);
 }
 
 /* Do the card and the share mean the same track? Same byte count, and a date that the FAT
  * rounding of the share's own date explains. Size is part of the identity because two chunks of
  * one station come out the same length to the kilobyte and never to the byte. */
+/* Diagnostics for the one failure mode that costs the most here: the identity test deciding a
+ * track is new when it is on the card. A miss means 43 MB across the radio for bytes the card
+ * already holds, so the arithmetic must be visible in the log, not inferred from the traffic. */
+static int      s_id_size_hits;      /* card files whose SIZE matched the share's entry */
+static long long s_id_last_delta;    /* card - expected, for the last such near-miss */
+
 static bool same_track(long long card_size, long long card_mtime, long long share_size,
                        long long share_mtime)
 {
     if (card_size != share_size || !fat_time_usable(share_mtime)) return false;
     long long want = share_mtime + (long long)s_cfg.tzo_min * 60;
     long long off = card_mtime - want;
-    return off > -FAT_TIME_TOL_S && off < FAT_TIME_TOL_S;
+    if (off > -FAT_TIME_TOL_S && off < FAT_TIME_TOL_S) return true;
+    s_id_size_hits++; s_id_last_delta = off;
+    return false;
 }
 
 /* dir + "/" + name, with overflow made visible: a truncated path names some other file, and this
@@ -862,6 +902,15 @@ static bool scan_dir_for_track(const char *dir, long long size, long long mtime,
     bool hit = false;
     while ((de = readdir(d)) != NULL) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        /* A .part is unfinished business, not a track: it holds the bytes of an interrupted
+         * transfer, so its length is anything up to the real size. Letting it into the identity
+         * search means a size match can rename a TRUNCATED file into the final name and report
+         * it as a copy that never needed making. Measured on the bench: the three .part files
+         * left by three deferred tracks were the "3 card file(s) have the same size" hits, saved
+         * only because FatFs stamps a new file with its 1980 fallback - an accident, not a
+         * guard. A .part that ever gets a real date would have been filed as complete. */
+        size_t nlen = strlen(de->d_name);
+        if (nlen > 5 && !strcmp(de->d_name + nlen - 5, ".part")) continue;
         if (!arch_join(s_arch_full, PATHMAX, dir, de->d_name)) continue;
         struct stat st;
         if (stat(s_arch_full, &st) != 0 || !S_ISREG(st.st_mode)) continue;
@@ -895,7 +944,14 @@ static bool archive_relocate(const char *dst_rel, long long size, long long mtim
         }
         closedir(top);
     }
-    if (!found[0]) return false;
+    if (!found[0]) {
+        if (s_id_size_hits) {
+            ESP_LOGW(TAG, "  %s: %d card file(s) have the same size but the date is off by %lld s (tzo=%d) - not treating them as the same track",
+                     dst_rel, s_id_size_hits, s_id_last_delta, (int)s_cfg.tzo_min);
+            s_id_size_hits = 0;
+        }
+        return false;
+    }
 
     char *dst = s_arch_dst;
     if (!card_path(dst, PATHMAX, dst_rel)) return false;
