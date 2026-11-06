@@ -290,7 +290,7 @@ called:
 | | |
 |---|---|
 | identity | the `(size, mtime)` pair the SMB2 `readdir` reply already carries — no extra round trip |
-| placement | `<ldir>/YYYYMMDD/<name>` — one folder per day under the configured card folder (`ldir`, default `/MUSIC`; `/` puts them at the top of the volume), the date taken from the share's own mtime in the owner's zone (`tzo`), so the folder and the date the head unit shows cannot disagree. Depth matters: many head units index only one or two levels |
+| placement | `<ldir>/YYYYMMDD/HHMMSS_<name>` — one folder per day, and the name leads with the chunk's own start time because the recorder's names are positional (`07.mp3` means "third-newest", so a later chunk reuses a name the card filed hours ago with different bytes) under the configured card folder (`ldir`, default `/MUSIC`; `/` puts them at the top of the volume), the date taken from the share's own mtime in the owner's zone (`tzo`), so the folder and the date the head unit shows cannot disagree. Depth matters: many head units index only one or two levels |
 | already have it? | look for those bytes anywhere on the card; found under an older name → `rename(2)` it. FatFs moves a file between directories by rewriting the **directory entry**, so no megabytes cross the Wi-Fi and no clusters are reallocated |
 | retention | keep the newest `keepd` date folders, retire the oldest whole folder — decided by the **card's own calendar**, so a network that is down cannot delete anything |
 | card full | retire the single oldest folder and retry the file, one folder per file rather than clearing the card in a bad moment |
