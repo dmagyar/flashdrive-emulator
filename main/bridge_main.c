@@ -98,7 +98,7 @@ static const char *TAG = "bridge";
  * and lwIP advertises only CONFIG_LWIP_TCP_WND_DEFAULT (16 KB), so a bigger response is
  * delivered across several window openings. Measured: 64 KB reads stream fine from a host and
  * stall here after the first one, so the size is memory headroom, not the cure - the stall
- * itself is handled by READ_STALL_RETRIES. */
+ * stall ends the pass; see the invariant at the fetch_one stall handler. */
 #define READ_CHUNK_MAX 32768
 /* Measured on the NAS, per 1 MiB file, same link:
  *    8 KiB -> 4.0 s   32 KiB -> 23.0 s and 12.8 s (erratic)
@@ -141,6 +141,10 @@ static volatile bool s_host_owns;        /* true while the volume is mounted for
 static volatile bool s_abort;            /* set from the USB ISR context: stop writing now */
 static volatile int64_t s_last_host_io;  /* us, only stamped while s_host_owns */
 static volatile uint32_t s_host_reads, s_host_writes;
+/* Set when a read stalls badly enough that the session cannot be trusted for the rest of this
+ * pass. The pass ends at the current file and do_sync reopens everything next pass; see the
+ * invariant at the fetch_one stall handler. */
+static volatile bool s_smb_stalled;
 static volatile bool s_wifi_up;
 
 /* ------------------------------------------------------------------- status LED */
@@ -1124,7 +1128,8 @@ static char *smb_path(char *out, size_t cap, const char *rel)
 /* One file, share -> card. Written to <name>.part then renamed, so the car never sees a
  * half-file even if the sync is cut short by the host plugging in. A transfer that runs out of
  * retries leaves the .part in place: the next sync continues from it rather than starting over.
- * See READ_STALL_RETRIES for why a failed read means a new connection, not a new file. */
+ * A failed read ends the pass, not the file: the .part holds the bytes and the next
+ * pass resumes from them. The session must not be rebuilt while walk() holds a handle. */
 static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64_t mtime)
 {
     char sp[PATHMAX], lp[PATHMAX], tp[PATHMAX + 8];
@@ -1197,7 +1202,7 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
              (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
              (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
 
-    int rc = 0, retries = 0, next_report_mb = 1;
+    int rc = 0, next_report_mb = 1;
     /* Start the flush counter where the transfer actually stands: a resumed 40 MB file would
      * otherwise fsync on every single write until the counter caught up. */
     next_sync = (off / (4ull * 1048576) + 1) * (4ull * 1048576);
@@ -1207,24 +1212,23 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
         int64_t t0 = esp_timer_get_time();
         int got = smb2_pread(s_smb, fh, buf, want, off);
         if (got <= 0) {
-            if (++retries > READ_STALL_RETRIES) {
-                ESP_LOGE(TAG, "pread %s @%llu: %s - %d reconnects did not help",
-                         sp, (unsigned long long)off, smb2_get_error(s_smb), retries - 1);
-                rc = ERR_SMB_IO; goto done;
-            }
-            ESP_LOGW(TAG, "  %llu/%llu B: %s - new connection, continue at %llu B (try %d/%d)",
+            /* INVARIANT: never rebuild the SMB context while walk() holds a smb2dir from it.
+             * walk() iterates that handle and closes it when the loop ends; smb_close_now() +
+             * smb_connect() destroys the context that owns it, and the next smb2_readdir - or the
+             * smb2_closedir at the end of the loop - then walks freed memory. That is not
+             * theoretical: a stalled read 5 files into a clean 430 MB pass produced
+             *   Guru Meditation Error: Core 0 panic'ed (LoadProhibited)
+             *   free_smb2dir libsmb2.c:200 <- smb2_closedir libsmb2.c:276 <- walk bridge_main.c:1402
+             * and a reboot in the middle of writing the card.
+             * So the session is left alone and the pass ends here. Nothing is lost: every byte is
+             * flushed to the card below, and the next pass resumes the same file from its .part
+             * with the prefix re-verified - a pass boundary instead of a crash. */
+            ESP_LOGW(TAG, "  %llu/%llu B: %s - session unusable, ending the pass here (resumes next pass at %llu B)",
                      (unsigned long long)off, (unsigned long long)size, smb2_get_error(s_smb),
-                     (unsigned long long)off, retries, READ_STALL_RETRIES);
+                     (unsigned long long)off);
             fflush(out); fsync(fileno(out));   /* never count a byte the card does not hold */
-            fh = NULL;                         /* belongs to the context being dropped */
-            smb_close_now();
-            if (smb_connect()) { rc = ERR_SMB_SESSION; goto done; }
-            fh = smb2_open(s_smb, sp, O_RDONLY);
-            if (!fh) {
-                ESP_LOGE(TAG, "reopen %s: %s", sp, smb2_get_error(s_smb));
-                rc = ERR_SMB_IO; goto done;
-            }
-            continue;
+            s_smb_stalled = true;
+            rc = ERR_SMB_SESSION; goto done;
         }
         if (off == 0)
             ESP_LOGI(TAG, "  first pread %d B in %lld ms", got,
@@ -1282,8 +1286,8 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
     }
 #endif
     s_copied_files++; s_copied_bytes += (long long)off;
-    ESP_LOGI(TAG, "  + %s  (%llu MB, %d reconnects, %llu files this run)", rel,
-             (unsigned long long)(off / 1048576), retries, (unsigned long long)s_copied_files);
+    ESP_LOGI(TAG, "  + %s  (%llu MB, %llu files this run)", rel,
+             (unsigned long long)(off / 1048576), (unsigned long long)s_copied_files);
 done:
     if (out) {
         fclose(out);
@@ -1389,9 +1393,13 @@ static int walk(const char *rel_dir, int depth)
         if (!frc) continue;
         /* One unreachable track must not starve the rest of the library. Only the card
          * itself (full, or writes failing) or the host taking the disk back ends the walk. */
-        if (frc == ERR_FAT || s_abort) {
-            ESP_LOGE(TAG, "%s: card problem (%s) - stopping this pass", rel,
-                     s_abort ? "host took the disk back" : "card write or free space");
+        if (frc == ERR_FAT || frc == ERR_SMB_SESSION || s_abort) {
+            /* A stalled session ends the pass on purpose: the directory handle this loop is
+             * iterating belongs to that session, so continuing would read from it again. */
+            ESP_LOGE(TAG, "%s: stopping this pass (%s)", rel,
+                     s_abort ? "host took the disk back" :
+                     frc == ERR_SMB_SESSION ? "SMB session stalled - resumes next pass" :
+                                              "card write or free space");
             rc = frc; break;
         }
         s_failed_files++;

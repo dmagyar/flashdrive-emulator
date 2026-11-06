@@ -88,7 +88,9 @@ sleep 8
 
 stty -F "$PORT" 115200 raw -echo
 : > "/tmp/$LOG"
-nohup timeout $((MAX + 180)) cat "$PORT" > "/tmp/$LOG" 2>/dev/null &
+# 9>&- : the capture must not inherit the bench lock (it would hold the bench
+# for its full timeout after this script exits, blocking the next run).
+nohup timeout $((MAX + 180)) cat "$PORT" > "/tmp/$LOG" 2>/dev/null 9>&- &
 CAT=$!
 sleep 1
 # Clean-slate run. The bridge, not the harness, decides who holds the volume: authorized=1 alone

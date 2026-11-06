@@ -66,7 +66,9 @@ trap 'auth 1 || true; umount "$MNT" 2>/dev/null || true' EXIT INT TERM
 
 stty -F "$PORT" 115200 raw -echo
 : > "/tmp/$LOG"
-setsid nohup sh -c "timeout 2400 cat $PORT >> /tmp/$LOG" >/dev/null 2>&1 < /dev/null &
+# 9>&- : do not let the capture inherit the bench lock, or it keeps the bench
+# for the whole length of its own timeout after this script has finished.
+setsid nohup sh -c "timeout 2400 cat $PORT >> /tmp/$LOG" >/dev/null 2>&1 < /dev/null 9>&- &
 sleep 2
 before=$(wc -l < "/tmp/$LOG")
 
