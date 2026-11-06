@@ -25,6 +25,8 @@ Working and verified on silicon. The full library syncs byte-exactly with no man
 | SD card write stage alone | **1430 KiB/s** |
 | byte integrity vs NAS | md5 identical: 4/4 files ×2 runs (61 MB) **and 10/10 files (411 MB)**, 0 reconnects |
 | interrupted transfers | resume from `.part` at the exact byte, after re-verifying the prefix |
+| converged pass (card already holds the share, share unchanged between passes) | **0 copied (0 bytes), 10 already present, 0 deferred** in **177–205 ms** of sync time (three passes measured, 10-entry share against a 411 MB card) — a plug-in with nothing new costs one directory walk, not 430 MB |
+| abandoned scratch on the card | swept: of three planted `.part` files exactly one (the orphan) was deleted, the two the sweep must not touch survived |
 | at the start of development | 8 KB/s (one socket timeout per request) |
 
 Not yet tested: a library larger than one card, and playback on a real head unit (all testing
@@ -320,6 +322,7 @@ cost the library.**
 |---|---|---|
 | A read stalls with a real SMB error | Ends the **pass** at that file. Bytes already read are flushed and `fsync`ed, the `.part` stays, the next pass resumes from it | It must not rebuild the SMB session mid-walk: `walk()` is iterating a directory handle owned by that session, and tearing it down under the walk faults the CPU. That was a real reboot, not a hypothetical — see below |
 | The share delivers fewer bytes than its `readdir` size | Logs `share ended at N of the advertised M B`, keeps the `.part`, counts the file **deferred**, and **carries on** with the rest | A rolling recorder replaces the newest chunk between the listing and the read, so the length is stale. A zero-length read with no SMB error is a clean EOF, not a dead connection — treating it as one used to abort the pass every time |
+| The share no longer has the entry a `.part` was copied from | A pass that walked the whole share deletes the `.part` nobody claimed: `x <path> (interrupted transfer; the share no longer has the entry to finish it)`, tallied as `scratch: N abandoned .part file(s) removed` | Dated filing names the card path after the chunk's own start time, so once the recorder rotates that entry out, no future pass ever computes that path again — the half-file would sit on the card forever. A `.part` this pass meant to resume is in the pass's own set, so it can never be the one deleted; names the filter excludes and `BRIDGE/` are never touched |
 | One track is unreadable (name clash, transfer fails) | Skips it, counts it, continues | A single bad file must not starve the rest of the library |
 | The card is full | Retires the **single oldest date folder** and retries that file | One folder per file, rather than clearing the card in a bad moment |
 | The host takes the volume back mid-file | Stops, keeps the `.part`, hands over | That is the normal end of a sync, not an error |
@@ -363,10 +366,17 @@ never re-fetched out of the recycle bin either.
 This ran on the host before it ever saw hardware: `tools/prune_host_test.py` extracts
 `prune_missing()` and its helpers **from `main/bridge_main.c`** (no copy, so it cannot drift) and
 executes them against a real directory tree with a stubbed share — the file I/O is the real
-thing. 26 checks cover: stale files deleted, live files kept, `.part`/non-matching/`BRIDGE/`
+thing. 30 checks cover: stale files deleted, live files kept, `.part`/non-matching/`BRIDGE/`
 untouched, empty-share and I/O-error guards deleting nothing, the cap firing at half (and at the
 50-file ceiling), subfolders removed once empty, case differences not treated as duplicates, an
 abort stopping the pass, and a pass that deletes exactly its allowance raising no cap warning.
+
+The scratch sweep has its own gate, `tools/scratch_host_test.py` (16 checks), extracted the same
+way: the orphan deleted, the `.part` this pass is resuming kept, non-matching names and `BRIDGE/`
+untouched, a `.part` whose card spelling differs in case still matching the share's registration,
+date folders walked, an abort stopping the sweep, and the pass's set overflowing into "skip the
+sweep" rather than a guess. It earned its keep on the first run, catching a `.part` stripped at
+the wrong offset — `track.mp3` became `track.mp`, so nothing was ever recognised.
 
 **Proven on the card** by `tools/prune_proof.sh 3` — three 1 MiB `.mp3` files the share never saw,
 plus three decoys, then one detach cycle:
@@ -533,6 +543,7 @@ aborts while the hardware is perfectly healthy.
 | `cold_sync_proof.sh` | wipe the synced files → cold sync → checksum every file against the NAS. The acceptance test |
 | `growth_sync_test.sh` | the everyday case: the share gained tracks. One detach cycle must fetch exactly what is new, resume any `.part`, skip the rest, then size-check the whole library and md5 the cheapest files. Long: background it |
 | `new_file_sync_test.sh` | single-file incremental proof. Drops a probe into a new folder on the share if the account can write; otherwise renames one synced file on the card (keeping the bytes as a safety net) to hit the same `walk()` branch |
+| `sweep_convergence_proof.sh <bin> <log> [max]` | plants three `.part` files — one abandoned, one with a name the filter excludes, one under `BRIDGE/` — and requires pass 1 to delete exactly the orphan while both guards survive and the mp3 count holds; then runs pass 2 over an untouched card and requires `0 copied (0 bytes)` if the share listing did not change between them. `PREFLIGHT=1` proves the mount plumbing in seconds, before a flash is spent |
 | `verify_card_vs_nas.sh` | md5 the card against the share, `ok`/`MISMATCH` per file |
 | `card_write_probe.sh` | card throughput in isolation (`BRIDGE_WRITE_ONLY`) |
 | `split_stages_test.sh` | network stage vs network+write stage (`BRIDGE_DRY_RUN`) |
