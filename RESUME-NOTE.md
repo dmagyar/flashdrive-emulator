@@ -1,3 +1,132 @@
+# Bridge — RESUME instructions
+
+**Read this section first if you are picking the project up cold** (written 2026-11-06 ~23:20 UTC).
+Everything below it is the previous session's note (2026-11-05): the throughput, Kconfig and
+libsmb2 material is still valid background, but read "Corrections to the note below" before quoting
+it. Long-form history with every measured number lives in `../RESUME-NOTES.md` — that file is **not
+in git** (`board-schematics/` is not a repo; this directory is), so treat it as a working document
+and this file as the durable one.
+
+## 1. State at save time (checked, not assumed)
+
+| thing | value |
+|---|---|
+| verdict | **Car test: GO** (given 2026-11-06 ~23:20 UTC) |
+| shipping image | `dist/bridge-car.bin`, `sha256 f847de54e978b751bb81da6065e0b1313ae9dc87122823cb17ab5465fcf19aa3`, 1,092,928 B |
+| verify any image before flashing | `strings -a dist/bridge-car.bin \| grep -c 'abandoned .part file'` → **1**. The file named `-car` was once one build behind the proven build: verify, never trust the filename |
+| board on bench | flashed from that exact image, `Hash of data verified`; card's `BRIDGE/STATUS.TXT` firmware stamp reads `Nov 6 2026 20:26:12` |
+| card | dated-archive layout `20261106/HHMMSS_NN.mp3`, 11 tracks, 0 `.part`, FAT clean after `fsck.fat -r`, 14.6 GB free of 15 GB |
+| git | branch `main`, pushed to `origin` (private `github.com/dmagyar/flashdrive-emulator`) |
+
+## 2. Standing user instruction
+
+> "Why I do have to say go? Just do your things until I'm ready to test in the car"
+
+Run the loop autonomously — fix → host test → build → flash → prove on hardware → commit → push —
+and report at milestones; do not stop for permission. Secrets never go in chat, git, logs or argv:
+SMB creds are `/root/.smbcreds` (600) on the bench, provisioning answers are `../bridge.local.cfg`
+(600, outside the repo).
+
+## 3. Resume in three commands
+
+```sh
+# 0) bench free? board on the bus? (0 harnesses = free; the ESP32 shows as USB vendor 303a)
+ssh -i ~/.ssh/aithinker_flash_ed25519 root@10.119.0.199 \
+  "pgrep -cf 'archive_proo[f]|sweep_conver[g]ence|one_pas[s]|card_integrity_audi[t]'; \
+   for d in /sys/bus/usb/devices/*; do [ \"\$(cat \$d/idVendor 2>/dev/null)\" = 303a ] && echo \$d; done"
+
+# 1) host tests first - they extract the C out of main/bridge_main.c, so they cannot drift from the
+#    shipping source, and they are what has caught every logic defect before any hardware was touched
+cd /home/hermes/board-schematics/bridge
+python3 tools/archive_host_test.py && python3 tools/prune_host_test.py && python3 tools/scratch_host_test.py
+
+# 2) build, then flash + prove one pass on the bench (4th arg 0 = keep the card, 1 = wipe first)
+bash -c 'source /home/hermes/esp/esp-idf/export.sh >/dev/null 2>&1; idf.py build'    # NEVER pipe through head
+cp build/app.bin dist/<name>.bin
+scp -i ~/.ssh/aithinker_flash_ed25519 dist/<name>.bin tools/archive_proof.sh root@10.119.0.199:/root/bridge/
+ssh -i ~/.ssh/aithinker_flash_ed25519 root@10.119.0.199 \
+  "cd /root/bridge && rm -f /tmp/run.out; setsid sh -c 'sh archive_proof.sh <name>.bin run.log 900 0 \
+    > /tmp/run.out 2>&1; echo EXIT=\$? >> /tmp/run.out' </dev/null >/dev/null 2>&1 & sleep 5; head -3 /tmp/run.out"
+```
+
+Poll `/tmp/run.out` in **separate short calls**: the terminal tool's foreground caps at ~420 s
+whatever timeout you pass, and piping a live job through `tail` buffers until exit, so a healthy run
+looks stalled. Expect `== flash <bin> ==` → `image sha256: …` → `flasher verification lines: 1` →
+`== VERDICT: PASS ==`. Grep for `BAILOUT` / `REFUSE` before believing any exit code.
+Audit the card any time the bridge has released the volume (read-only, board untouched):
+`sh /root/bridge/card_integrity_audit.sh` on the bench.
+
+## 4. Already proven — do not re-litigate
+
+- **Dedup against a rolling source.** The recorder rotates positional slot names (`NN.mp3`) every
+  30 min, so a name is not an identity. Identity is `(size, mtime)`; filing is
+  `YYYYMMDD/HHMMSS_<name>`; a chunk the card already holds is **renamed, not re-fetched** ("same
+  bytes: a directory write, not a transfer"). Measured: 8 of 10 filed by rename with only the
+  genuinely new chunks transferred; a pass over an unchanged window copies **0 files / 0 bytes in
+  177–205 ms**.
+- **Nothing is wrongly deleted.** The source-availability prune stands down while the dated archive
+  is on (retention is the destination's own calendar); any "share did not answer" answer keeps the
+  file; the delete cap bounds a runaway pass.
+- **Interruption is not corruption.** Volume taken mid-file → `.part` kept and resumed from the last
+  `fsync` (40 MiB aborted at 12 MiB resumed at exactly 12,582,912 B); clean EOF on a rotated chunk →
+  partial kept, file counted deferred, pass continues; abandoned scratch swept by registered identity
+  (bench: 1 orphan removed, both guards kept).
+- **Card content is byte-exact.** `card_integrity_audit.sh`: 9/11 tracks md5-identical to the
+  share's live window **under different names**, 2 correctly archived, 0 truncated, 0 scratch; and
+  FatFs mounts a volume that Linux `fsck.fat -r` repaired.
+- **Read path for the car: 0.38 MB/s** host→card through the bridge (1-bit SDMMC + FAT, both ways;
+  Wi-Fi is not the limit). ~16× a 192 kbps stream, but a head unit that indexes all 470 MB at mount
+  can look dead for ~20 min — **tell the user before he drives**.
+- **A pass runs only after the car releases the disk** (physical `DETACHED` + quiet period). No
+  timer, no boot pass: "it didn't sync" means "it was never let go".
+
+## 5. Next work, in order
+
+1. **FAT accounting discrepancy — the one open defect, and it is bounded.** Repair to zero
+   (`fsck.fat -r`, unmounted, volume released), run a pass, re-check (`fsck.fat -n`). Three measured
+   points: **0** after repair, **6488 clusters (53,149,696 B = 50.7 MiB)** after a pass that wrote
+   86 MB, **the same 6488** after a later pass that wrote 43 MB — so this is a *constant,
+   non-accumulating* discrepancy of ~0.35 % of the card that each pass re-creates, **not** a leak
+   that eats the card pass over pass. (The obvious suspect was the boot write-probe
+   `BRIDGE/zz-speedtest.part` — rejected: it writes 8 MiB, not 50.7 MiB.) FSINFO's free count is
+   wrong by exactly the same 6488 every time. Still worth pinning down: **does `card_free_bytes()`
+   (FatFs `f_getfree`) trust the stale FSINFO or walk the FAT?** If it trusts it, the 64 MB headroom
+   rule and `archive_retire_oldest()` see 50.7 MB less than exists, which is a constant bias, not a
+   countdown — annoying, not fatal. Repro recipe (each step is one short call):
+   `fsck.fat -r /dev/sdb` → one `archive_proof.sh` pass → `fsck.fat -n /dev/sdb | grep -i reclaim`.
+2. **Flat + stamped fallback — ONLY if the head unit cannot read one folder level.** Do **not** use
+   `keepd=0`: mirror mode files by the source name (positional) and dedups on **size only**
+   (`archive_target()` picks the destination at `bridge_main.c:834`; `card_has()` at `:1479`; the
+   identity relocate is gated on `keep_days` at `:1496`), so against this recorder it re-fetches
+   ~430 MB per 43 MB of new audio **and can keep a same-size, wrong-content file**. Correct change:
+   keep identity filing and drop only the folder — in `archive_target()`, when `keep_days == 0`,
+   still run `archive_stamped_name()` on the base name, and give retention a file-count rule instead
+   of a folder rule. Extend `tools/archive_host_test.py`, then prove with one bench pass.
+3. **Idle-takeover (user's idea)** — `s_last_host_io` is already stamped on every SCSI read in the
+   blockdev wrapper. Needs a measured silence window from one real ride first, and an NVS flag that
+   defaults off. Do not start before the user has driven with it.
+4. **Recorder consolidation (user's decision, not a bug).** Two recorders run the same station: this
+   host's container publishes to a local folder, while `CAR-MEDIA` on the Synology is filled by a
+   second instance elsewhere (its live `recording-<epoch>.part` is 1443 s out of phase, 0/10 files
+   match by content, `./media` is a plain ext4 bind with no CIFS, and this host runs no `smbd`).
+   Until the user picks one, `KEEP=10` (5 h window) is what the bridge must live with — and it does.
+
+## 6. Corrections to the note below (2026-11-05 → 2026-11-06)
+
+- **Timestamps are solved without SNTP**: every copy carries the share's own mtime (FAT stores bare
+  local time, 2 s granularity, pre-1980 refused), and the date drives the archive folder. The
+  "files land stamped Jan 1 1980 / SNTP before caring" line is obsolete — 1980 now means "a fresh
+  file that has not been stamped yet", and it is what exposed a `.part` being treated as an identity
+  match.
+- **Share layout changed**: the card is no longer a flat mirror, it is `YYYYMMDD/HHMMSS_<name>` (one
+  level below the root) with the volume root holding only `BRIDGE/`.
+- **`verify_card_vs_nas.sh` compares by path**, which the archive layout breaks by design (same
+  bytes, different name). Use `card_integrity_audit.sh`, which compares content.
+- Throughput figures below (370–400 KB/s) are **ingest** (share→card). The reverse direction, card→
+  host, measures **0.38 MB/s**, and the 61 MB library used there is now a ~470 MB window.
+
+---
+
 # Bridge — resume note (2026-11-05, end of session)
 
 ## Status: the sync works end to end. Proven on silicon, byte-checked.

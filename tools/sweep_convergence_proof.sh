@@ -129,13 +129,18 @@ if [ "${PREFLIGHT:-0}" = "1" ]; then
 fi
 
 echo "== flash $BIN =="
-# Record WHICH BYTES go into flash: a proof belongs to the image in the chip, not to the source tree,
+# Record WHICH BYTES go into flash: a proof belongs to the bytes in the chip, not to the source tree,
 # and the bench deletes the copy it was handed. Without this line the question "did the board really
 # run the build under test?" is unanswerable after the run.
 echo "image sha256: $(sha256sum "$BIN" | cut -d' ' -f1)  size: $(stat -c %s "$BIN")"
 authorize 1 || true
+FLASHLOG=/tmp/flash-$$.txt
 esptool --chip esp32s3 -p "$PORT" --before default-reset --after no-reset \
-        write_flash 0x20000 "$BIN" 2>&1 | tail -2
+        write_flash 0x20000 "$BIN" > "$FLASHLOG" 2>&1 || { tail -4 "$FLASHLOG"; echo "BAILOUT: esptool write_flash failed"; rm -f "$FLASHLOG"; exit 1; }
+VERS=$(grep -c 'Hash of data verified' "$FLASHLOG" || true)
+rm -f "$FLASHLOG"
+[ "$VERS" -ge 1 ] || { echo "BAILOUT: flasher reported no 'Hash of data verified' ($VERS)"; exit 1; }
+echo "  flasher verification lines: $VERS"
 esptool --chip esp32s3 -p "$PORT" --before default-reset --after hard-reset \
         flash-id >/dev/null 2>&1
 sleep 8

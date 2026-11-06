@@ -78,9 +78,20 @@ authorize () {
 trap 'authorize 1 >/dev/null 2>&1 || true' EXIT INT TERM
 
 echo "== flash $BIN =="
+# Record WHICH BYTES go into flash, and require the flasher's own verification. A proof belongs to
+# the image in the chip, not to the source tree - and the bench deletes the copy it was handed, so
+# without the sha the question "did the board really run the build under test?" is unanswerable
+# after the run. Without the "Hash of data verified" count, a script that only scps an image can
+# happily "prove" the previous build.
+echo "image sha256: $(sha256sum "$BIN" | cut -d' ' -f1)  size: $(stat -c %s "$BIN")"
 authorize 1 || true
+FLASHLOG=/tmp/flash-$$.txt
 esptool --chip esp32s3 -p "$PORT" --before default-reset --after no-reset \
-        write_flash 0x20000 "$BIN" 2>&1 | tail -2
+        write_flash 0x20000 "$BIN" > "$FLASHLOG" 2>&1 || { tail -4 "$FLASHLOG"; echo "BAILOUT: esptool write_flash failed"; rm -f "$FLASHLOG"; exit 1; }
+VERS=$(grep -c 'Hash of data verified' "$FLASHLOG" || true)
+rm -f "$FLASHLOG"
+[ "$VERS" -ge 1 ] || { echo "BAILOUT: flasher reported no 'Hash of data verified' ($VERS)"; exit 1; }
+echo "  flasher verification lines: $VERS"
 # The flash leaves it in the bootloader; this reset is what boots the app.
 esptool --chip esp32s3 -p "$PORT" --before default-reset --after hard-reset \
         flash-id >/dev/null 2>&1
