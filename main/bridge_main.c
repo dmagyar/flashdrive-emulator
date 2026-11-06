@@ -1182,6 +1182,55 @@ static char *smb_path(char *out, size_t cap, const char *rel)
     return smb_path_into(out, cap, s_cfg.sub, rel);
 }
 
+/* ------------------------------------------------------- .part scratch, this pass's business
+ * fetch_one() writes <final>.part and renames it into place when the last byte lands. A .part is
+ * only ever revisited through the share entry whose card path maps onto it - and with dated filing
+ * that path is derived from the chunk's own start time, so once the recorder has rotated an entry
+ * out of the share, NO future pass computes that path again. The scratch then stays on the card for
+ * good: 43 MB of a track that will never be finished, visible to the head unit as a broken track.
+ * Three of them sat on the bench card through pass after pass that way - the pruner skips .part on
+ * purpose, and retention retires whole date folders, never single files.
+ *
+ * So a pass records every .part it intends to resume or create, and a walk that ran to completion
+ * deletes the ones nobody claimed (sweep_parts(), further down). The set holds FNV-1a-64 hashes of
+ * the card-relative FINAL path - 8 B per entry instead of PATHMAX - case-folded, because FatFs
+ * names are case-insensitive and a hash built on the share's spelling has to match the card's. A
+ * hash can only err by matching something it should not, and that keeps a stale file for one more
+ * pass; a .part this pass meant to finish is in the set by construction, so it can never be the one
+ * deleted. A pass with more entries than the set holds skips the sweep entirely rather than guess. */
+#define PART_KEEP_MAX 128
+static uint64_t s_part_keep[PART_KEEP_MAX];
+static int s_part_keep_n;
+static bool s_part_keep_full;
+static char s_part_rel[PATHMAX];            /* this entry's final path, while sweep_parts decides */
+static long long s_scratch_removed;
+
+static uint64_t fnv64_folded(const char *p)
+{
+    uint64_t h = 1469598103934665603ULL;                        /* FNV-1a offset basis */
+    for (; *p; p++) {
+        h ^= (uint64_t)(unsigned char)tolower((unsigned char)*p);
+        h *= 1099511628211ULL;                                  /* FNV-1a prime */
+    }
+    return h;
+}
+
+/* Called by fetch_one() for every entry it is about to transfer: that .part is live business. */
+static void part_keep_add(const char *rel_final)
+{
+    if (s_part_keep_n >= PART_KEEP_MAX) { s_part_keep_full = true; return; }
+    while (*rel_final == '/') rel_final++;
+    s_part_keep[s_part_keep_n++] = fnv64_folded(rel_final);
+}
+
+static bool part_keep_has(const char *rel_final)
+{
+    uint64_t h = fnv64_folded(rel_final);
+    for (int i = 0; i < s_part_keep_n; i++)
+        if (s_part_keep[i] == h) return true;
+    return false;
+}
+
 /* One file, share -> card. Written to <name>.part then renamed, so the car never sees a
  * half-file even if the sync is cut short by the host plugging in. A transfer that runs out of
  * retries leaves the .part in place: the next sync continues from it rather than starting over.
@@ -1194,6 +1243,9 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
     if (!card_path(lp, sizeof(lp), rel)) return ERR_FAT;
     int tpn = snprintf(tp, sizeof(tp), "%s.part", lp);
     if (tpn < 0 || tpn >= (int)sizeof(tp)) return ERR_FAT;
+    /* Registered before anything can fail: if this pass meant to finish these bytes, the sweep at
+     * the end of the pass must not treat the .part as abandoned - even when this entry then fails. */
+    part_keep_add(rel);
     mk_parents(lp);
 
     ESP_LOGI(TAG, "get %s (%llu B)", sp, (unsigned long long)size);
@@ -1406,7 +1458,14 @@ static int walk(const char *rel_dir, int depth)
         if (!rel[0]) continue;
 
         if (is_dir) {
-            if (s_cfg.recurs && depth < s_depth_limit) rc = walk(rel, depth + 1);
+            if (s_cfg.recurs && depth < s_depth_limit) {
+                /* A nested failure is this pass's failure. Dropping the return value here let a
+                 * card-full or a stalled session inside one subfolder vanish while the outer loop
+                 * kept reading the same stalled session - and do_sync's guards (prune, retention,
+                 * the scratch sweep) all read "the walk finished" out of this return value. */
+                int sub = walk(rel, depth + 1);
+                if (sub) { rc = sub; break; }
+            }
             continue;
         }
         if (!matches_filter(name)) continue;
@@ -1646,12 +1705,66 @@ static void prune_missing(long long share_seen)
                  s_deleted_files, card);
 }
 
+/* --------------------------------------------------------- abandoned scratch on the card
+ * Delete the .part files no share entry claimed this pass - the bytes of a transfer the share can
+ * no longer finish, because the entry that was being copied has been rotated out (see the
+ * bookkeeping above fetch_one()). It runs only on a pass that walked the whole share, so
+ * "unclaimed" really means "nothing left in the share maps here"; a pass that ended early says
+ * nothing about files it never reached.
+ *   dir_abs - the card folder being walked
+ *   strip   - strlen(card root)+1, so paths are reported relative to the card, not the mount
+ * Two guards, both borrowed from the pruner: a name that does not match the media filter once
+ * ".part" is stripped was never ours to manage, so the owner's own files on this card are
+ * untouchable; and the BRIDGE folder is skipped, since it holds the status file and the write
+ * probe's scratch, which the probe owns for the duration of the pass.
+ */
+static void sweep_parts(const char *dir_abs, size_t strip, int depth)
+{
+    DIR *d = opendir(dir_abs);
+    if (!d) return;                                    /* vanished under us */
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (s_abort) break;                            /* the host wants its disk back */
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (depth == 0 && !strcmp(de->d_name, "BRIDGE")) continue;
+        char full[PATHMAX];
+        if (!arch_join(full, sizeof(full), dir_abs, de->d_name)) continue;
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth < s_depth_limit) sweep_parts(full, strip, depth + 1);
+            continue;
+        }
+        size_t n = strlen(de->d_name);
+        if (n <= 5 || strcmp(de->d_name + n - 5, ".part") != 0) continue;
+
+        const char *rel = full + strip;
+        size_t rl = strlen(rel);
+        if (rl < 6 || rl >= PATHMAX) continue;         /* ".part" plus a name, and it must fit */
+        memcpy(s_part_rel, rel, rl); s_part_rel[rl] = 0;
+        s_part_rel[rl - 5] = 0;                        /* drop ".part": the path it was writing */
+        /* s_part_rel belongs to this entry only. Nothing here is re-entered while it still holds
+         * something: the folder recursion above returns before the next use below. */
+        if (!matches_filter(s_part_rel)) continue;
+        if (part_keep_has(s_part_rel)) continue;
+        if (unlink(full) != 0) {
+            ESP_LOGE(TAG, "  unlink %s: %s", s_part_rel, strerror(errno));   /* never count it */
+            continue;
+        }
+        s_scratch_removed++;
+        ESP_LOGI(TAG, "  x %s  (interrupted transfer; the share no longer has the entry to finish it)",
+                 s_part_rel);
+    }
+    closedir(d);
+}
+
 static int do_sync(void)
 {
     s_copied_files = s_skipped_files = s_copied_bytes = s_failed_files = 0;
     s_deleted_files = s_kept_uncertain = 0;
     s_dated_files = 0;
     s_moved_files = s_retired_folders = s_retired_bytes = 0;   /* archive tallies are per run too */
+    s_part_keep_n = 0; s_part_keep_full = false; s_scratch_removed = 0;
 
     /* Modem sleep off, for the duration of the transfer only. The radio sleeps every DTIM
      * interval (102 ms on this AP) and the AP queues our segments meanwhile; combined with the
@@ -1675,6 +1788,19 @@ static int do_sync(void)
     rc = walk("/", 0);
     /* What the share offered this pass: the guard prune_missing() refuses to work without. */
     share_seen = s_copied_files + s_skipped_files;
+    /* Scratch first, then the pruner and retention: a date folder whose last real file is gone
+     * should be judged empty in the same pass that dropped the half-written file inside it. */
+    if (!rc && !s_abort) {
+        if (s_part_keep_full) {
+            /* The set is a bound on how much of the pass we remember. Guessing is worse: an entry
+             * we forgot would read as "abandoned" and cost 43 MB of re-transfer. */
+            ESP_LOGW(TAG, "scratch sweep skipped: %d entries this pass, the set holds %d",
+                     s_part_keep_n, PART_KEEP_MAX);
+        } else {
+            char root[PATHMAX];
+            if (card_root(root, sizeof(root))) sweep_parts(root, strlen(root) + 1, 0);
+        }
+    }
     if (!rc && !s_abort) prune_missing(share_seen);
     /* Retention runs on a good pass only: a walk that failed halfway says nothing reliable about
      * what the card should hold. */
@@ -1689,6 +1815,8 @@ static int do_sync(void)
     if (s_dated_files)
         ESP_LOGI(TAG, "dates: %lld file(s) now carry the share's own date (%+d min vs UTC)",
                  (long long)s_dated_files, s_cfg.tzo_min);
+    if (s_scratch_removed)
+        ESP_LOGI(TAG, "scratch: %lld abandoned .part file(s) removed", s_scratch_removed);
     if (s_moved_files || s_retired_folders)
         ESP_LOGI(TAG, "archive: %lld file(s) filed by rename (no transfer), %lld date folder(s) "
                       "retired (%lld MB freed)", (long long)s_moved_files,

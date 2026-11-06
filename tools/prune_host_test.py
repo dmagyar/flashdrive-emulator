@@ -32,6 +32,12 @@ def extract(src):
     parts.append(slice_between(src, "static const char *const NOISE[]", "static bool card_path", "filter"))
     parts.append(slice_between(src, "static bool card_path", "static void mk_parents", "card_path"))
     parts.append(slice_between(src, "static void rel_join", "static int s_depth_limit", "walk helpers"))
+    # The .part sweep lives in the same region as the pruner and shares its rules, so the pruner's
+    # compile gate has to build it too: arch_join() joins the paths, and the bookkeeping block holds
+    # the set the sweep consults. Both must precede the region that calls them.
+    parts.append(slice_between(src, "static bool arch_join", "static bool scan_dir_for_track", "arch_join"))
+    parts.append(slice_from_comment(src, ".part scratch, this pass's business",
+                                    "/* One file, share -> card"))
     parts.append(slice_from_comment(src, "stale media on the card", "static int do_sync(void)"))
     return "\n".join(parts)
 
