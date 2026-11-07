@@ -1925,10 +1925,17 @@ static void on_usb_event(tinyusb_event_t *ev, void *arg)
  * Cost: a unit that insists on writing its index may refuse the drive outright. One car ride
  * answers that; the fallback is one line (return true) and a rebuild. */
 bool tud_msc_is_writable_cb(uint8_t lun);
+#ifndef BRIDGE_RO_DEFAULT
+#define BRIDGE_RO_DEFAULT 1     /* the car's answer: the head unit never writes to this card */
+#endif
+
 bool tud_msc_is_writable_cb(uint8_t lun)
 {
     (void)lun;
-    return false;
+    /* Build-time, not runtime: the bench harness has to WRITE the card over the same USB link the
+     * car would only ever read, and a switch the harness could flip by accident would mean the
+     * firmware tested is not the firmware driven. BRIDGE_RO_DEFAULT=0 builds the bench variant. */
+    return !BRIDGE_RO_DEFAULT;
 }
 
 static void on_msc_event(tinyusb_msc_storage_handle_t h, tinyusb_msc_event_t *ev, void *arg)

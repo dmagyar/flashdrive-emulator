@@ -23,7 +23,7 @@ idf_component_register(
 # variable - it is never turned into a preprocessor define, so a build that believed it carried
 # 60 shipped the hardcoded 0 instead (proven: the identifier occurred zero times in
 # build/compile_commands.json, while the log line reported "+0 min vs UTC"). Forward them.
-foreach(_bridge_var BRIDGE_TZO_DEFAULT BRIDGE_KEEP_DAYS_DEFAULT)
+foreach(_bridge_var BRIDGE_TZO_DEFAULT BRIDGE_KEEP_DAYS_DEFAULT BRIDGE_RO_DEFAULT)
     if(DEFINED ${_bridge_var})
         target_compile_definitions(${COMPONENT_LIB} PRIVATE "${_bridge_var}=${${_bridge_var}}")
     endif()
