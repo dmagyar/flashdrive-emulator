@@ -360,6 +360,20 @@ Resume reads the sidecar and clamps it to the track size, so it can never mistak
 downloaded data and rename a hollow file into the library as a finished track. A missing sidecar
 means "start this file again", which is safe rather than optimistic.
 
+**A card that survived an uncontrolled cut, measured.** Pulling the plug mid-session (the cable also
+drops the console, so the card is the only witness) left: the board re-enumerated on the bus and handed
+the volume over, `RO=1` with `Write Protect is on`, `fsck.fat -n` reporting no dirty flag and no errors,
+`STATUS.TXT` at `error class 0`, and every track intact. A wedged board recovers from a plain power
+cycle with no operator knowledge - which is the failure that ended one drive. What this test cannot
+show is the ownership reconciler: it needs the host to go quiet *while power stays up*, which is what a
+head unit does when the car sleeps but the accessory rail stays live. Only the car can produce that.
+
+To do host-side surgery on a read-only-exporting card (deleting junk the firmware should never have
+kept), flash the writable variant momentarily, since the read-only bit is what blocks the host:
+`idf.py -DBRIDGE_RO_DEFAULT=0 build` -> flash -> mount read-write, delete, `sync`, unmount -> reflash
+the `BRIDGE_RO_DEFAULT=1` car build and verify `RO=1` again. `tools/clean_rec.sh` does exactly this and
+proves both halves in one run.
+
 What a supercapacitor on the 5 V rail would add, and what it would not:
 - It would buy 15-20 s at Wi-Fi-active draw, enough to stop starting new files, `fsync` and close the
   one in progress, and unmount cleanly — but only if paired with a way to *sense* the rail dropping
