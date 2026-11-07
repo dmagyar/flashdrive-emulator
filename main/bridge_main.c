@@ -1817,9 +1817,14 @@ static int do_sync(void)
      * what the card should hold. */
     if (!rc && !s_abort && s_cfg.keep_days > 0) archive_retire_to(s_cfg.keep_days);
     smb_close();
-    write_status_file(s_storage, rc ? "sync-failed" : "sync-done", rc);
+    /* Three endings, not two. "Yielded because the host wants its music" is the ordinary outcome
+     * of a bridge that syncs while parked and gets plugged in mid-pass; calling it FAILED made the
+     * status file and the log blame a fault that never happened, and a reader (or a script) cannot
+     * tell the car behaving normally from a broken SMB session. The two real outcomes keep their
+     * exact wording - the harnesses grep for "sync done:" and "sync FAILED:". */
+    write_status_file(s_storage, s_abort ? "sync-yielded" : (rc ? "sync-failed" : "sync-done"), rc);
     ESP_LOGI(TAG, "sync %s: %lld copied (%lld bytes), %lld already present, %lld deferred, %lld pruned",
-             rc ? "FAILED" : "done", (long long)s_copied_files,
+             s_abort ? "yielded (host took the disk)" : (rc ? "FAILED" : "done"), (long long)s_copied_files,
              (long long)s_copied_bytes, (long long)s_skipped_files,
              (long long)s_failed_files, (long long)s_deleted_files);
     /* Its own line, not a column on the one above: scripts parse that line's tail. */
@@ -2125,7 +2130,8 @@ void app_main(void)
                 continue;
             }
             int rc = 0;
-            if (s_wifi_up) { s_abort = false; rc = do_sync(); }
+            bool host_took_disk = false;
+            if (s_wifi_up) { s_abort = false; rc = do_sync(); host_took_disk = s_abort; }
             else { ESP_LOGW(TAG, "host detached but Wi-Fi is down - handing the disk straight back");
                    s_err_class = ERR_WIFI; write_status_file(s_storage, "wifi-down", ERR_WIFI); }
 
@@ -2133,9 +2139,15 @@ void app_main(void)
             if (tinyusb_msc_set_storage_mount_point(s_storage, TINYUSB_MSC_STORAGE_MOUNT_USB) != ESP_OK) {
                 ESP_LOGE(TAG, "cannot hand the disk back to USB"); s_state = ST_ERROR; s_err_class = rc;
             } else {
+                /* A host that takes the disk back mid-pass is the car being a car: the head unit
+                 * wants its music while the bridge wanted a file. That is not a fault, and
+                 * reporting it as one lit the error LED on every drive - the owner would see red
+                 * on a bridge that had just done exactly the right thing by yielding. */
                 s_host_owns = true;
-                s_state = rc ? ST_ERROR : ST_READY;
-                s_err_class = rc;
+                int shown = host_took_disk ? 0 : rc;
+                if (host_took_disk && rc) ESP_LOGI(TAG, "pass ended early because the host took the disk - not an error");
+                s_state = shown ? ST_ERROR : ST_READY;
+                s_err_class = shown;
             }
         }
         if (xTaskGetTickCount() - last_report > pdMS_TO_TICKS(60000)) {
