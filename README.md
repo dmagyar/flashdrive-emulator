@@ -335,6 +335,33 @@ Two consequences worth knowing before reading a log:
 - **Nothing here formats the card.** See
   [Mount failure refuses the card](#mount-failure-refuses-the-card).
 
+### Power cuts: the sync window *is* the risk window
+
+The device lives in the car. It syncs when the head unit is off and the home Wi-Fi is in range —
+which is exactly when the car is about to be switched off and left. Avoiding "risky" write times is
+therefore not available as a strategy; a cut at an arbitrary instant has to cost nothing.
+
+A 40 MB write into a growing file makes FatFs extend the FAT continuously for the two minutes the
+transfer takes, so a cut can land inside FAT *metadata* and damage the volume rather than the file.
+The card proved this after a drive: dosfstools had recovered `FSCK0000.REC` through `FSCK0003.REC`,
+and `FSCK0003.REC`'s first 256 KiB is byte-identical to a track already on the card — a duplicate
+allocation of one of our own files, interrupted mid-write. (The other recovered clusters are 14-minute
+MP3s at 104 and 378 kbps and one 128 KiB non-audio cluster: none match the recorder's 192 kbps
+30-minute chunks, so something besides the bridge was writing media to the card — which is what the
+read-only export now prevents.)
+
+So the scratch file is **preallocated to the track's full size and `fsync`ed before any audio moves**:
+the cluster chain is committed in one short metadata operation, and after that writes touch only the
+data area, where a cut spoils that one scratch file and nothing else.
+
+Because the file's length then reports what was *reserved* rather than what *arrived*, the committed
+length lives in a sidecar — `<name>.part.len`, rewritten after every 4 MB flush, deleted on rename.
+Resume reads the sidecar and clamps it to the track size, so it can never mistake reserved space for
+downloaded data and rename a hollow file into the library as a finished track. A missing sidecar
+means "start this file again", which is safe rather than optimistic.
+
+What a supercapacitor on the 5 V rail would add, and what it would not:
+
 ### Deleting what left the share
 
 `walk()` only adds. After the write phase, `prune_missing()` walks the card and removes media the
@@ -623,3 +650,9 @@ IDF's strict warnings for that one component with `-Wno-error` (visible, not sil
 - [libsmb2](https://github.com/sahlberg/libsmb2) by Ronnie Sahlberg — userspace SMB2/3 client.
 - [esp_tinyusb](https://github.com/espressif/esp-tinyusb) — ESP-IDF TinyUSB component, whose MSC
   blockdev + mount-ownership API makes the one-owner-at-a-time design possible.
+- It would buy 15-20 s at Wi-Fi-active draw, enough to stop starting new files, `fsync` and close the
+  one in progress, and unmount cleanly — but only if paired with a way to *sense* the rail dropping
+  (a divider into a GPIO). Without the sensor the charge is wasted, because nothing tells the
+  firmware to use it.
+- It would not make the head unit's writes safe, because it is on the wrong side of the cable: the
+  LUN is exported read-only, which is the real answer to that half of the problem.
