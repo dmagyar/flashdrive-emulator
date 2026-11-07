@@ -350,6 +350,37 @@ MP3s at 104 and 378 kbps and one 128 KiB non-audio cluster: none match the recor
 30-minute chunks, so something besides the bridge was writing media to the card — which is what the
 read-only export now prevents.)
 
+### The read-only export can cost you the whole drive
+
+**Measured in the field: a head unit refused to list the drive at all while the LUN was exported
+read-only, and the same card on the same build showed up fine on a Mac.** Green LED, so `ATTACHED`
+fired and the volume was handed over - the unit enumerated the device and then declined the medium.
+The likely mechanism is the write-protect bit in the `MODE SENSE` reply: a unit that wants to keep its
+own index on the drive gives up when told the media cannot be written, whereas a computer simply mounts
+it read-only. Elimination narrows it further - between the build that played in the car and this one,
+the only difference visible to the unit during enumeration is the read-only export.
+
+So `BRIDGE_RO_DEFAULT` is a build-time choice, not a free win:
+
+| Build | Flag | Use |
+|---|---|---|
+| `dist/bridge-rw.bin` | `BRIDGE_RO_DEFAULT=0` | units that refuse write-protected media (this car) |
+| `dist/bridge-ro-car.bin` | `BRIDGE_RO_DEFAULT=1` | units that list the drive anyway, when you want the card guaranteed unwritable |
+
+With a writable LUN the head unit can write to the card again, and the recovered-cluster evidence says
+some consumer previously did. What still protects the library is everything else on this page: our own
+writes commit their cluster chain up front, a cut costs a scratch file, and a `.part` can never be
+mistaken for a finished track.
+
+**The LED answers "does the unit even want the drive?" from the passenger seat.** Every sector the
+consumer pulls goes through the counting blockdev, so while the volume is handed over and the host has
+read within the last two seconds the LED flickers **white** instead of sitting solid green. White with
+no music = the medium was accepted and the content or layout is the problem; green that never turns
+white = the unit never issued a single read, which is a medium-rejection problem, not a filesystem one.
+Those two look identical on the car's display. Each read *burst* also logs one line
+(`host is reading: LBA n x N B ... the consumer accepted the medium`) - `LBA 0` means it read the boot
+sector, no line at all means it never asked.
+
 So the scratch file is **preallocated to the track's full size and `fsync`ed before any audio moves**:
 the cluster chain is committed in one short metadata operation, and after that writes touch only the
 data area, where a cut spoils that one scratch file and nothing else.

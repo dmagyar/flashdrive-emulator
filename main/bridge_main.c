@@ -169,6 +169,22 @@ static void led_task(void *arg)
     TickType_t every = pdMS_TO_TICKS(300);
     while (1) {
         state_t st = s_state;
+        /* White flicker = the consumer is reading the drive right now, measured rather than
+         * inferred: every sector the host pulls passes through the counting blockdev. This is the
+         * instrument for "the unit enumerates the stick but shows nothing". Green with no white
+         * ever means the head unit never issued a single read, which is a medium-rejection problem
+         * (write-protect bit, MODE SENSE dialect, card layout) and not a filesystem one; white with
+         * no music means the medium was accepted and the content or the layout is the problem. The
+         * two look identical from the car's display and have different fixes. */
+        int64_t since_io = esp_timer_get_time() - s_last_host_io;
+        if (s_host_owns && s_last_host_io && since_io < 2 * 1000000) {
+            bool on = (phase & 1);
+            led_rgb(on ? 90 : 10, on ? 90 : 10, on ? 90 : 10);
+            every = pdMS_TO_TICKS(140);
+            vTaskDelay(every);
+            if (++phase > 4000) phase = 0;
+            continue;
+        }
         switch (st) {
         case ST_READY:   led_rgb(0, 90, 0);  every = pdMS_TO_TICKS(300); break;
         case ST_SYNC:    led_rgb(0, 0, (phase & 1) ? 90 : 0);   /* blinking blue = syncing */
@@ -204,7 +220,19 @@ static esp_err_t c_read(esp_blockdev_handle_t dev, uint8_t *dst, size_t dst_size
                         uint64_t src, size_t len)
 {
     esp_err_t e = s_real->ops->read(s_real, dst, dst_size, src, len);
-    if (e == ESP_OK && s_host_owns) { s_last_host_io = esp_timer_get_time(); s_host_reads++; }
+    if (e == ESP_OK && s_host_owns) {
+        int64_t now = esp_timer_get_time();
+        /* One line per read burst (a burst starts after 2 s of quiet), so a head unit's scan shows
+         * up as a handful of lines instead of thousands. "Where did it stop reading?" is the whole
+         * answer when a unit refuses the drive: LBA 0 x 512 = it read the boot sector and accepted
+         * the medium; no line at all = it never asked for a single byte. */
+        if (now - s_last_host_io > 2 * 1000000)
+            ESP_LOGI(TAG, "host is reading: LBA %llu x %u B (read #%lu) - the consumer accepted the medium",
+                     (unsigned long long)(src / 512), (unsigned)len,
+                     (unsigned long)(s_host_reads + 1));
+        s_last_host_io = now;
+        s_host_reads++;
+    }
     return e;
 }
 static esp_err_t c_write(esp_blockdev_handle_t dev, const uint8_t *src, uint64_t dst, size_t len)
