@@ -361,6 +361,12 @@ downloaded data and rename a hollow file into the library as a finished track. A
 means "start this file again", which is safe rather than optimistic.
 
 What a supercapacitor on the 5 V rail would add, and what it would not:
+- It would buy 15-20 s at Wi-Fi-active draw, enough to stop starting new files, `fsync` and close the
+  one in progress, and unmount cleanly — but only if paired with a way to *sense* the rail dropping
+  (a divider into a GPIO). Without the sensor the charge is wasted, because nothing tells the
+  firmware to use it.
+- It would not make the head unit's writes safe, because it is on the wrong side of the cable: the
+  LUN is exported read-only, which is the real answer to that half of the problem.
 
 ### Deleting what left the share
 
@@ -650,9 +656,3 @@ IDF's strict warnings for that one component with `-Wno-error` (visible, not sil
 - [libsmb2](https://github.com/sahlberg/libsmb2) by Ronnie Sahlberg — userspace SMB2/3 client.
 - [esp_tinyusb](https://github.com/espressif/esp-tinyusb) — ESP-IDF TinyUSB component, whose MSC
   blockdev + mount-ownership API makes the one-owner-at-a-time design possible.
-- It would buy 15-20 s at Wi-Fi-active draw, enough to stop starting new files, `fsync` and close the
-  one in progress, and unmount cleanly — but only if paired with a way to *sense* the rail dropping
-  (a divider into a GPIO). Without the sensor the charge is wasted, because nothing tells the
-  firmware to use it.
-- It would not make the head unit's writes safe, because it is on the wrong side of the cable: the
-  LUN is exported read-only, which is the real answer to that half of the problem.
