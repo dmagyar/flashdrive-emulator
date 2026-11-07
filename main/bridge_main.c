@@ -1189,6 +1189,54 @@ static char *smb_path(char *out, size_t cap, const char *rel)
     return smb_path_into(out, cap, s_cfg.sub, rel);
 }
 
+/* How many bytes of a .part actually arrived.
+ *
+ * A .part is now preallocated to the track's full size before any audio moves (see fetch_one), so
+ * its length reports what was RESERVED, not what was downloaded. Without a separate record the
+ * resume path would read a freshly reserved scratch file as complete and rename it into the
+ * library as a finished track - precisely the failure the .part scheme exists to prevent. Written
+ * after every fsync, so a power cut can lose only the bytes since the last flush; a missing or
+ * corrupt sidecar means "start this file again", which is safe rather than optimistic. */
+static void plen_path(char *out, size_t cap, const char *part)
+{
+    snprintf(out, cap, "%s.len", part);
+}
+
+static void plen_write(const char *part, uint64_t n)
+{
+    char pl[PATHMAX];
+    plen_path(pl, sizeof(pl), part);
+    FILE *f = fopen(pl, "wb");
+    if (!f) return;
+    unsigned char b[8];
+    for (int i = 0; i < 8; i++) b[i] = (unsigned char)((n >> (8 * i)) & 0xFF);
+    if (fwrite(b, 1, 8, f) != 8) { fclose(f); unlink(pl); return; }
+    fflush(f);
+    fsync(fileno(f));
+    if (fclose(f) != 0) unlink(pl);
+}
+
+static uint64_t plen_read(const char *part, uint64_t size)
+{
+    char pl[PATHMAX];
+    plen_path(pl, sizeof(pl), part);
+    FILE *f = fopen(pl, "rb");
+    if (!f) return 0;
+    unsigned char b[8];
+    uint64_t n = 0;
+    if (fread(b, 1, 8, f) == 8)
+        for (int i = 0; i < 8; i++) n |= (uint64_t)b[i] << (8 * i);
+    fclose(f);
+    return n <= size ? n : 0;      /* never trust a sidecar that claims more than the track holds */
+}
+
+static void plen_unlink(const char *part)
+{
+    char pl[PATHMAX];
+    plen_path(pl, sizeof(pl), part);
+    unlink(pl);
+}
+
 /* ------------------------------------------------------- .part scratch, this pass's business
  * fetch_one() writes <final>.part and renames it into place when the last byte lands. A .part is
  * only ever revisited through the share entry whose card path maps onto it - and with dated filing
@@ -1286,7 +1334,13 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
     out = fopen(tp, "r+b");
     if (out) {
         fseek(out, 0, SEEK_END);
-        long have = ftell(out);
+        long physical = ftell(out);
+        long have = (long)plen_read(tp, size);      /* committed bytes, not reserved space */
+        if (physical >= 0 && (uint64_t)physical < size && size <= 0x7FFFF000) {
+            /* Scratch from before the reservation existed, or a reservation that failed: commit
+             * the chain now so this transfer is protected too. */
+            if (ftruncate(fileno(out), (off_t)size) == 0) fsync(fileno(out));
+        }
         bool keep = have > 0 && (uint64_t)have <= size && have <= 0x7FFFF000;
         if (keep) {
             unsigned char head[512];
@@ -1297,11 +1351,14 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
         }
         if (keep) {
             off = (uint64_t)have;
-            ESP_LOGI(TAG, "  continuing %s at %llu/%llu B (prefix verified)", rel,
-                     (unsigned long long)have, (unsigned long long)size);
-            fseek(out, 0, SEEK_END);     /* writes append from here on; off tracks the length */
+            ESP_LOGI(TAG, "  continuing %s at %llu/%llu B (prefix verified, %lld B of %llu B reserved)", rel,
+                     (unsigned long long)have, (unsigned long long)size,
+                     (long long)physical, (unsigned long long)size);
+            fseek(out, (long)off, SEEK_SET);   /* overwrite the reserved-but-unwritten space */
         } else {
-            fclose(out); unlink(tp); out = NULL;
+            /* No committed length we can believe: start the file again, but take the sidecar with
+             * it so the two never disagree about what a .part holds. */
+            fclose(out); unlink(tp); plen_unlink(tp); out = NULL;
         }
     }
     if (!out) {
@@ -1312,6 +1369,28 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
             return ERR_FAT;
         }
         off = 0;
+        /* Commit the cluster chain before a single byte of audio moves.
+         *
+         * Writing 40 MB into a growing file makes FatFs extend the FAT continuously for the two
+         * minutes the transfer takes, so the power cut a car delivers when you park can land in
+         * the middle of FAT metadata and cost the VOLUME rather than the file. That is not a
+         * hypothetical: the card came back from the car carrying FSCK0003.REC, a duplicate
+         * allocation of 20261106/173929_01.mp3 recovered by dosfstools after the FAT went
+         * inconsistent mid-write. Reserving the length up front puts that metadata work into one
+         * short operation (5000 clusters x 4 B is a few sectors); from then on the writes touch
+         * only the data area, where a cut spoils this scratch file and nothing else.
+         *
+         * The file is deliberately not truncated back as it fills - which is why the committed
+         * length lives in the sidecar above instead of in the file's own length. */
+        if (size > 0 && ftruncate(fileno(out), (off_t)size) == 0) {
+            fsync(fileno(out));
+            plen_write(tp, 0);
+            ESP_LOGI(TAG, "  reserved %llu B on the card up front - a power cut now costs this scratch file, not the volume",
+                     (unsigned long long)size);
+        } else {
+            ESP_LOGW(TAG, "  cannot reserve %llu B (%s) - writing without a committed cluster chain",
+                     (unsigned long long)size, strerror(errno));
+        }
     }
 #endif
     ESP_LOGI(TAG, "  chunk %u B, heap %u/%u KiB", (unsigned)chunk,
@@ -1374,6 +1453,7 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
                 rc = ERR_FAT; goto done;
             }
             next_sync += 4ull * 1048576;
+            plen_write(tp, off + (uint64_t)got);   /* this is where a cut would resume from */
         }
 #endif
         off += (unsigned)got;
@@ -1402,7 +1482,9 @@ static int fetch_one(const char *smb_rel, const char *rel, uint64_t size, uint64
     out = NULL;
     /* A rename that fails is a naming problem, not bad bytes: the .part keeps every byte
      * already transferred, so it stays for the next run instead of being discarded. */
-    if (rename(tp, lp) != 0) {
+    int renamed = rename(tp, lp);
+    if (renamed == 0) plen_unlink(tp);          /* the scratch is the track now; no sidecar needed */
+    if (renamed != 0) {
         ESP_LOGE(TAG, "rename %s -> %s: %s", tp, lp, strerror(errno));
         rc = ERR_CONFLICT; goto done;
     }
@@ -1757,6 +1839,11 @@ static void sweep_parts(const char *dir_abs, size_t strip, int depth)
         if (unlink(full) != 0) {
             ESP_LOGE(TAG, "  unlink %s: %s", s_part_rel, strerror(errno));   /* never count it */
             continue;
+        }
+        {   /* a sidecar is worth nothing without the scratch file it describes */
+            char pl[PATHMAX];
+            plen_path(pl, sizeof(pl), full);
+            unlink(pl);
         }
         s_scratch_removed++;
         ESP_LOGI(TAG, "  x %s  (interrupted transfer; the share no longer has the entry to finish it)",
