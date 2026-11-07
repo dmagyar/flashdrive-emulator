@@ -857,6 +857,10 @@ static void archive_target(char *out, size_t cap, const char *rel, long long mti
 /* Diagnostics for the one failure mode that costs the most here: the identity test deciding a
  * track is new when it is on the card. A miss means 43 MB across the radio for bytes the card
  * already holds, so the arithmetic must be visible in the log, not inferred from the traffic. */
+/* Set when the card mounts for nobody: the head unit still gets the disk (its own FAT driver may
+ * read a volume ours refuses), but nothing here may write to it this boot. */
+static volatile bool s_card_refused;
+
 static int      s_id_size_hits;      /* card files whose SIZE matched the share's entry */
 static long long s_id_last_delta;    /* card - expected, for the last such near-miss */
 
@@ -1067,6 +1071,7 @@ static long long s_deleted_files, s_kept_uncertain;   /* pruning, reported in th
 
 static void write_status_file(tinyusb_msc_storage_handle_t storage, const char *phase, int err)
 {
+    if (s_card_refused) return;   /* no mount to write into; the log already says why */
     char dir[PATHMAX];
     snprintf(dir, sizeof(dir), "%s/BRIDGE", MSC_PATH);
     mkdir(dir, 0777);
@@ -1760,6 +1765,10 @@ static void sweep_parts(const char *dir_abs, size_t strip, int depth)
 
 static int do_sync(void)
 {
+    if (s_card_refused) {
+        ESP_LOGW(TAG, "sync skipped: the card was refused at boot, exporting it read-only to the head unit beats syncing onto it");
+        return -1;
+    }
     s_copied_files = s_skipped_files = s_copied_bytes = s_failed_files = 0;
     s_deleted_files = s_kept_uncertain = 0;
     s_dated_files = 0;
@@ -1844,6 +1853,28 @@ static void on_usb_event(tinyusb_event_t *ev, void *arg)
     }
 }
 
+/* The head unit must never write to this card.
+ *
+ * A media player does not just read: many units keep their own index on the drive (a track DB, a
+ * resume point, a playlist), written while the engine is running and cut off mid-write when the
+ * car sleeps. That is the worst possible combination here - a second writer with no idea the first
+ * one exists, and an unclean power loss to finish it. The result is a dirty or inconsistent FAT on
+ * a volume we then refuse to mount, which reads to the owner as "it worked, then it died".
+ *
+ * Answering "not writable" once makes TinyUSB report the LUN write-protected in MODE SENSE(6) AND
+ * refuse WRITE10 with SCSI sense DATA PROTECT / 0x27, so a well-behaved host mounts it read-only
+ * and never issues the write at all. The bridge becomes the only writer in the system, and it
+ * writes only while it owns the disk - which by construction is when the head unit does not.
+ *
+ * Cost: a unit that insists on writing its index may refuse the drive outright. One car ride
+ * answers that; the fallback is one line (return true) and a rebuild. */
+bool tud_msc_is_writable_cb(uint8_t lun);
+bool tud_msc_is_writable_cb(uint8_t lun)
+{
+    (void)lun;
+    return false;
+}
+
 static void on_msc_event(tinyusb_msc_storage_handle_t h, tinyusb_msc_event_t *ev, void *arg)
 {
     (void)h; (void)arg;
@@ -1882,7 +1913,19 @@ void app_main(void)
 
     /* ---- medium ---- */
     esp_blockdev_handle_t raw = NULL;
-    if (!sd_open(&raw)) { s_state = ST_FATAL; s_err_class = ERR_NOCARD; s_state = ST_ERROR; return; }
+    /* Give the card more than one try. After an unclean power loss - which is how a car ends every
+     * drive - an SD card can legitimately fail its first initialisation: the clock ramp, the OCR
+     * handshake and the bus state after a supply that drooped rather than opened all want a clean
+     * power-on. Failing the first attempt and then never returning to it is how "worked fine, then
+     * after a sleep the USB entry was gone for good" happens: this line ran before TinyUSB was
+     * installed, so the board simply never appeared on the bus again. */
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        raw = NULL;
+        if (sd_open(&raw)) break;
+        ESP_LOGW(TAG, "card did not answer on attempt %d", attempt);
+        vTaskDelay(pdMS_TO_TICKS(400));
+    }
+    if (!raw) { s_state = ST_FATAL; s_err_class = ERR_NOCARD; s_state = ST_ERROR; return; }
     esp_blockdev_handle_t bdl = wrap_blockdev(raw);
 
     /* ---- USB device stack, MSC backed by the card ---- */
@@ -1908,7 +1951,27 @@ void app_main(void)
         },
         .mount_point = TINYUSB_MSC_STORAGE_MOUNT_APP,   /* we start as owner */
     };
-    ESP_ERROR_CHECK(tinyusb_msc_new_storage_blockdev(&scfg, &s_storage));
+    esp_err_t serr = tinyusb_msc_new_storage_blockdev(&scfg, &s_storage);
+    if (serr != ESP_OK) {
+        /* Refusing the card was the right call, but refusing it by aborting was not: ESP_ERROR_CHECK
+         * here rebooted the board, so the head unit saw a device that attached, stalled and
+         * vanished - reported from the car as "media error", then no USB entry at all. Degrade
+         * instead: hand the raw disk to the host with no local mount at all. The unit reads the
+         * volume with its own FAT driver and plays; we write nothing; the LED says 6 blinks.
+         * A card the car can play and the bridge declines to touch is the better failure. */
+        ESP_LOGE(TAG, "filesystem refused the card (%s) - exporting it to the host with no local mount, and syncing nothing",
+                 esp_err_to_name(serr));
+        tinyusb_msc_storage_config_t hcfg = scfg;
+        hcfg.mount_point = TINYUSB_MSC_STORAGE_MOUNT_USB;
+        hcfg.fat_fs.do_not_format = true;
+        hcfg.fat_fs.config.format_if_mount_failed = false;
+        if (tinyusb_msc_new_storage_blockdev(&hcfg, &s_storage) != ESP_OK) {
+            s_err_class = ERR_NOCARD; s_state = ST_ERROR;
+            ESP_LOGE(TAG, "card cannot be exported at all - staying off the USB bus rather than looping");
+            return;
+        }
+        s_card_refused = true;
+    }
 
     uint32_t sec = 0, ss = 0;
     tinyusb_msc_get_storage_capacity(s_storage, &sec);
