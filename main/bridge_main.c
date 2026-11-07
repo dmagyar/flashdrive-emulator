@@ -75,6 +75,7 @@
 
 #include "led_strip.h"
 #include "tinyusb.h"
+#include "tusb.h"          /* tud_mounted()/tud_suspended(): the bus is the only ground truth for "is a host there" */
 #include "tinyusb_default_config.h"
 #include "tinyusb_msc.h"
 
@@ -141,6 +142,7 @@ static volatile int s_err_class;
 static volatile bool s_host_owns;        /* true while the volume is mounted for USB */
 static volatile bool s_abort;            /* set from the USB ISR context: stop writing now */
 static volatile int64_t s_last_host_io;  /* us, only stamped while s_host_owns */
+static volatile int64_t s_suspend_since; /* us, 0 = bus not suspended */
 static volatile uint32_t s_host_reads, s_host_writes;
 /* Set when a read stalls badly enough that the session cannot be trusted for the rest of this
  * pass. The pass ends at the current file and do_sync reopens everything next pass; see the
@@ -1837,6 +1839,60 @@ static int do_sync(void)
 /* --------------------------------------------------------------------- USB side */
 static SemaphoreHandle_t s_host_gone;
 
+/* USB ownership has to survive a host that leaves without saying so.
+ *
+ * A head unit that loses power when the car sleeps does not always produce a detach the device can
+ * see: this carrier wires no VBUS sense, so a supply that droops or a port that simply goes quiet
+ * can leave the stack still "configured" as far as the firmware knows. Ownership used to move only
+ * on ATTACHED/DETACHED, so one missed pair wedged the bridge in whichever state it happened to be
+ * in. If that was "the host owns the volume", the car got no media - and no USB entry at all when
+ * it came back, because ATTACHED only aborted a sync and never handed the volume over. Measured on
+ * the bench without a car: LED solid green ("the host owns the volume") while the host enumerated
+ * no device whatsoever.
+ *
+ * So poll the bus instead of trusting the events. TinyUSB reports suspend once no SOF has arrived
+ * for 3 ms, which a head unit that is PLAYING never causes (it keeps the bus alive) and an absent
+ * host causes at once; ten seconds of it means the host is gone. And when a host is present while
+ * we hold the volume, the host wins outright: the car's music outranks a sync, which can wait for
+ * the next gap.
+ */
+#define HOST_GONE_SUSPEND_US  (10 * 1000 * 1000)
+
+static void ownership_reconcile(void)
+{
+    if (s_card_refused) return;
+
+    if (s_host_owns) {
+        if (!tud_suspended()) { s_suspend_since = 0; return; }
+        if (!s_suspend_since) { s_suspend_since = esp_timer_get_time(); return; }
+        if (esp_timer_get_time() - s_suspend_since < HOST_GONE_SUSPEND_US) return;
+
+        s_suspend_since = 0;
+        ESP_LOGW(TAG, "bus suspended 10 s with the volume handed over - the host left without a detach; taking it back");
+        if (tinyusb_msc_set_storage_mount_point(s_storage, TINYUSB_MSC_STORAGE_MOUNT_APP) != ESP_OK) {
+            ESP_LOGE(TAG, "cannot take the volume back from a vanished host");
+            s_host_owns = true;
+            return;
+        }
+        s_host_owns = false;
+        s_state = ST_WAIT;
+        if (s_wifi_up) { s_abort = false; (void)do_sync(); s_abort = false; }
+        /* Stay app-owned deliberately. Handing it back to a suspended bus would only let the next
+         * timeout take it again, and mounting and unmounting a FAT every few seconds is worse than
+         * not syncing at all. A real ATTACHED hands it back. */
+        return;
+    }
+
+    if (tud_mounted()) {
+        ESP_LOGW(TAG, "a USB host is present while we hold the volume - handing it over; media outranks a sync");
+        if (tinyusb_msc_set_storage_mount_point(s_storage, TINYUSB_MSC_STORAGE_MOUNT_USB) == ESP_OK) {
+            s_host_owns = true; s_suspend_since = 0; s_state = ST_READY; s_err_class = 0;
+        } else {
+            ESP_LOGE(TAG, "cannot hand the volume to a present host - the unit will report a media error");
+        }
+    }
+}
+
 static void on_usb_event(tinyusb_event_t *ev, void *arg)
 {
     (void)arg;
@@ -2043,7 +2099,13 @@ void app_main(void)
 
     TickType_t last_report = xTaskGetTickCount();
     while (1) {
-        if (xSemaphoreTake(s_host_gone, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (xSemaphoreTake(s_host_gone, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            /* Nothing happened this second - which is exactly when the events we cannot see
+             * matter, so this is where ownership gets reconciled against the bus. */
+            ownership_reconcile();
+            continue;
+        }
+        {
             /* Wait out any in-flight host traffic, then take the disk. The host is already
              * gone electrically; the quiet period only covers a car that is re-attaching. */
             int64_t quiet = esp_timer_get_time() - s_last_host_io;
